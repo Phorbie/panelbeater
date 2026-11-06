@@ -1,0 +1,12 @@
+{
+  "name": "panelbeater",
+  "version": "0.1.0",
+  "description": "Precise, numeric reshaping of 3D-printable bodies in the browser. Stretch, taper, mirror STL and 3MF files.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test",
+    "serve": "python3 -m http.server 8080"
+  }
+}
