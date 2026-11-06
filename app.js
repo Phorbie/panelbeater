@@ -972,17 +972,21 @@ function currentRecipe() {
   return makeRecipe(state.ops, { name: state.fileName, faces: state.sourceFaces });
 }
 
-$('#btn-open').addEventListener('click', () => $('#file-model').click());
-$('#btn-recipe-load').addEventListener('click', () => $('#file-recipe').click());
+// Read the file before clearing the input: Safari can drop the File once value is reset.
+// Clearing afterwards lets you pick the same file again.
 $('#file-model').addEventListener('change', async (e) => {
-  const f = e.target.files[0];
-  e.target.value = '';
-  if (f) openBuffer(f.name, await f.arrayBuffer());
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  let buf;
+  try { buf = await f.arrayBuffer(); } catch (err) { toast(`Couldn't read ${f.name}: ${err.message}`); return; } finally { e.target.value = ''; }
+  openBuffer(f.name, buf);
 });
 $('#file-recipe').addEventListener('change', async (e) => {
-  const f = e.target.files[0];
-  e.target.value = '';
-  if (f) applyRecipeText(await f.text());
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  let text;
+  try { text = await f.text(); } catch (err) { toast(`Couldn't read ${f.name}: ${err.message}`); return; } finally { e.target.value = ''; }
+  applyRecipeText(text);
 });
 
 function applyRecipeText(text) {

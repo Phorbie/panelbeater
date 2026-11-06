@@ -100,6 +100,8 @@ input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-o
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 .btn.primary:hover { filter: brightness(1.08); }
 .btn svg { width: 16px; height: 16px; flex: none; }
+.vh { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.vh:focus-visible + .btn { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ---------- workspace ---------- */
 .work { display: grid; grid-template-columns: minmax(0, 1fr) clamp(320px, 30vw, 400px); min-height: 0; }
@@ -257,17 +259,19 @@ kbd { font: 11px var(--f-num); border: 1px solid var(--line); border-radius: 3px
     <span class="filechip" id="filechip">No model loaded</span>
   </div>
   <div class="actions">
-    <button class="btn" id="btn-open" type="button" title="Open an STL or 3MF file">
+    <!-- Native label → input: opens the picker in every browser and sandboxed view, no script click needed.
+         No accept filter: Safari and iOS grey out .3mf files they don't recognise; the loader validates instead. -->
+    <input type="file" id="file-model" class="vh">
+    <label class="btn" for="file-model" id="btn-open" title="Open an STL or 3MF file">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4.5h4l1.5 1.5H14v6.5H2z"/></svg>Open model
-    </button>
-    <button class="btn" id="btn-recipe-load" type="button" title="Load a saved recipe (.json)">Load recipe</button>
+    </label>
+    <input type="file" id="file-recipe" class="vh">
+    <label class="btn" for="file-recipe" id="btn-recipe-load" title="Load a saved recipe (.json)">Load recipe</label>
     <button class="btn" id="btn-recipe-save" type="button" title="Save the operation stack as a recipe (.json)">Save recipe</button>
     <button class="btn primary" id="btn-export" type="button" title="Export the full result as a binary STL">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 2v8m-3.5-3.5L8 10l3.5-3.5M3 13.5h10"/></svg>Export STL
     </button>
   </div>
-  <input type="file" id="file-model" accept=".stl,.3mf,model/stl,model/3mf" hidden>
-  <input type="file" id="file-recipe" accept=".json,application/json" hidden>
 </header>
 
 <main class="work">
