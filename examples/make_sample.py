@@ -45,5 +45,15 @@ for x, y in ((-8, -64), (8, -64), (-8, 28), (8, 28)):  # body-post holes
 m = body.to_mesh()
 tm = trimesh.Trimesh(vertices=m.vert_properties[:, :3], faces=m.tri_verts)
 assert tm.is_watertight, 'sample should be watertight'
-tm.export(__file__.replace('make_sample.py', 'sample-pickup.stl'))
+# ASCII STL: plain text, so any static host (including ones that refuse binary model types) serves it.
+f = lambda v: ('%.4f' % v).rstrip('0').rstrip('.')
+lines = ['solid sample_pickup']
+for face, n in zip(tm.triangles, tm.face_normals):
+    lines.append('facet normal %s %s %s' % tuple(map(f, n)))
+    lines.append(' outer loop')
+    lines += [' vertex %s %s %s' % tuple(map(f, v)) for v in face]
+    lines.append(' endloop')
+    lines.append('endfacet')
+lines.append('endsolid sample_pickup')
+open(__file__.replace('make_sample.py', 'sample-pickup.stl'), 'w').write('\n'.join(lines) + '\n')
 print(len(tm.faces), 'faces', tm.extents)
