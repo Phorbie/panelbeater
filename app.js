@@ -30,18 +30,36 @@ const state = {
 /* ================================================================ viewer */
 
 const stage = $('#stage');
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-renderer.autoClear = false;
-stage.prepend(renderer.domElement);
+
+// The 3D view is optional. If the browser has WebGL switched off (a Firefox
+// setting, a managed work machine, an old GPU driver), everything except the
+// picture still works: open, steps, recipes, size readout, export.
+let renderer = null;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.autoClear = false;
+  stage.prepend(renderer.domElement);
+} catch (err) {
+  console.warn('Panelbeater: 3D view unavailable.', err);
+  renderer = null;
+  const note = document.createElement('div');
+  note.className = 'nogl';
+  note.setAttribute('role', 'status');
+  note.innerHTML = '<strong>3D view unavailable</strong>'
+    + '<p>This browser has WebGL turned off, so the model can\'t be drawn. Opening files, steps, recipes, the size readout and Export STL still work.</p>'
+    + '<p>To turn it on in Firefox, go to <code>about:config</code> and set <code>webgl.disabled</code> to <code>false</code>, or turn on hardware acceleration in Settings › Performance. Chrome and Edge also work.</p>';
+  stage.append(note);
+}
+const canvas = renderer ? renderer.domElement : document.createElement('canvas');
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(35, 1, 0.5, 5000);
 camera.up.set(0, 0, 1);
 camera.position.set(200, -260, 180);
 scene.add(camera);
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.addEventListener('change', requestRender);
+const controls = renderer ? new OrbitControls(camera, canvas) : null;
+controls?.addEventListener('change', requestRender);
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0x50555a, 1.15));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.7);
@@ -146,6 +164,7 @@ function requestRender() {
   requestAnimationFrame(() => { renderQueued = false; renderNow(); });
 }
 function renderNow() {
+  if (!renderer) return;
   const w = stage.clientWidth, h = stage.clientHeight;
   renderer.setScissorTest(false);
   renderer.setViewport(0, 0, w, h);
@@ -164,7 +183,7 @@ function renderNow() {
 
 new ResizeObserver(() => {
   const w = stage.clientWidth, h = stage.clientHeight;
-  if (!w || !h) return;
+  if (!w || !h || !renderer) return;
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
@@ -184,8 +203,10 @@ function frameView(name = 'iso') {
   camera.near = dist / 200;
   camera.far = dist * 20;
   camera.updateProjectionMatrix();
-  controls.target.copy(center);
-  controls.update();
+  if (controls) {
+    controls.target.copy(center);
+    controls.update();
+  }
   requestRender();
 }
 
@@ -846,12 +867,12 @@ window.addEventListener('keydown', (e) => {
 
 const raycaster = new THREE.Raycaster();
 let downAt = null;
-renderer.domElement.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; });
-renderer.domElement.addEventListener('pointerup', (e) => {
+canvas.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; });
+canvas.addEventListener('pointerup', (e) => {
   if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 4 || e.button !== 0) return;
   downAt = null;
   if (!bodyMesh) return;
-  const rect = renderer.domElement.getBoundingClientRect();
+  const rect = canvas.getBoundingClientRect();
   const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   const hit = raycaster.intersectObject(bodyMesh, false)[0];

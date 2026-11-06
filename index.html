@@ -148,6 +148,15 @@ input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-o
   font: 800 28px/1 var(--f-display); text-transform: uppercase; letter-spacing: .03em; color: var(--accent);
 }
 .loading { position: absolute; inset: 0; display: grid; place-items: center; z-index: 3; color: var(--muted); }
+.nogl {
+  position: absolute; z-index: 4; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: min(460px, calc(100% - 32px)); padding: 16px 18px; border-radius: var(--r);
+  background: var(--panel); border: 1px solid var(--line); box-shadow: 0 6px 24px rgb(0 0 0 / .18);
+  display: grid; gap: 8px; font-size: 13px;
+}
+.nogl strong { font: 700 18px/1.1 var(--f-display); text-transform: uppercase; letter-spacing: .05em; }
+.nogl p { margin: 0; color: var(--muted); }
+.nogl code { font: 12px var(--f-num); color: var(--ink); }
 
 /* ---------- op panel ---------- */
 .panel { overflow: auto; border-left: 1px solid var(--line); background: var(--panel); }

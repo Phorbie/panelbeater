@@ -42,6 +42,8 @@ Any shaping step can be **limited to a region** (an axis-aligned box) with a ble
 
 Any static file server works. ES modules don't load from `file://`.
 
+The 3D view uses WebGL 2, falling back to WebGL 1. With WebGL off entirely, the app still opens, applies steps and exports; it just can't draw the model.
+
 ```sh
 python3 -m http.server 8080   # then open http://localhost:8080
 ```
@@ -54,7 +56,7 @@ To host it, turn on GitHub Pages: Settings → Pages → Deploy from branch → 
 index.html      markup + styles
 app.js          UI: three.js viewer, step panel, pick-on-model, undo
 core.js         geometry: STL/3MF import, weld, refine, ops, mirror, STL export, recipes
-vendor/         three.js r170 + OrbitControls, pinned and vendored (MIT)
+vendor/         three.js r162 + OrbitControls, pinned and vendored (MIT)
 test/           node --test suite + tiny 3MF fixtures
 examples/       original sample body, its recipe, and the script that made it
 ```
@@ -70,6 +72,7 @@ node --test
 The project is meant to need very little looking after.
 
 - **No build, no npm dependencies.** three.js is vendored and only updated when a browser change forces it.
+- **three.js stays at r162.** It's the last release that falls back to WebGL 1. r163+ needs WebGL 2, which some browsers and managed work machines turn off. Don't upgrade past it without a reason that beats that.
 - **The recipe format is the contract.** `version: 1` recipes will keep loading. A change that would alter results for an existing recipe needs a new op type or a version bump, never a silent behaviour change.
 - **Geometry changes come with tests.** A PR that touches `core.js` adds or updates a case in `test/core.test.js`.
 - **Issues are the to-do list.** Bug reports are most useful with the source file (or a link to it), the recipe, and what you expected.
