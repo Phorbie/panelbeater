@@ -4,6 +4,8 @@ Reshape 3D-printable bodies with typed numbers. Load an STL or 3MF, then stack u
 
 It runs entirely in your browser. Nothing gets uploaded, there are no accounts, and there's no build step.
 
+**Use it:** https://phorbie.github.io/panelbeater/
+
 Built for RC scale bodies, but it works on anything shell-shaped.
 
 ## Why it exists
