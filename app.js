@@ -18,13 +18,27 @@ const state = {
   ops: [],
   selected: -1,
   cache: [],
-  view: { strain: false, ghost: false },
+  view: { heat: 'none', ghost: false }, // heat: 'none' | 'strain' | 'moved'
   pick: null,
-  result: null,
+  result: null, // what's drawn
+  info: null,   // notes + trace through the selected step
+  full: null,   // notes + trace for every step (filled in when idle)
+  moved: null,  // per-face displacement for the Moved view
   upTo: 0,
   check: null,
   clickPoint: null,
+  clickPoint2: null, // shift-click: second point for measuring
   regionOpen: new WeakMap(),
+  showIntro: false,
+};
+const OPS_HELP = {
+  rotate: 'Turns the model in 90° steps and sets it back on the mat. Use it first if the file is stood on end for printing.',
+  refine: 'Splits long triangles into smaller ones so later steps have points to bend. The shape doesn’t change.',
+  pin: 'Marks a box that later steps can’t stretch. Whatever is inside moves as one solid piece, so holes and mounts keep their size and spacing.',
+  stretch: 'Cuts the model at a plane and slides one or both sides apart. Walls keep their thickness; only faces crossing the plane get longer.',
+  taper: 'A stretch whose amount changes along a second axis, so one end can widen while the other stays put. Good for a trapezoid bed.',
+  move: 'Pushes everything inside the region along one axis. The blend distance sets how gently it fades into the rest.',
+  mirror: 'Cuts at a plane, discards one side and replaces it with a reflection of the other.',
 };
 
 /* ================================================================ viewer */
@@ -194,7 +208,9 @@ function frameView(name = 'iso') {
   if (!state.result) return;
   const bb = bbox(state.result.mesh);
   const dirs = { iso: [1.05, -1.45, 0.95], top: [0, -0.0001, 1], front: [0, -1, 0.0001], side: [1, 0, 0.0001] };
-  const dir = new THREE.Vector3(...(dirs[name] || dirs.iso)).normalize();
+  const dir = name === 'keep' && controls
+    ? camera.position.clone().sub(controls.target).normalize()
+    : new THREE.Vector3(...(dirs[name] || dirs.iso)).normalize();
   const center = new THREE.Vector3(...bb.center);
   const r = Math.max(Math.hypot(...bb.size) / 2, 5);
   const fov = THREE.MathUtils.degToRad(camera.fov);
@@ -219,7 +235,51 @@ function heatColor(s, out) {
   return out.copy(colors['heat-hi']);
 }
 
-function geometryFor(mesh, heat) {
+// Face colour function for the current shading mode, or null for plain primer.
+function faceColorFn(mesh) {
+  if (state.view.heat === 'strain') return (f, c) => heatColor(mesh.strain[f], c);
+  const mv = state.moved;
+  if (state.view.heat === 'moved' && mv && mv.faces.length === mesh.indices.length / 3 && mv.max > 1e-4) {
+    return (f, c) => {
+      const t = Math.min(1, mv.faces[f] / mv.max);
+      return t < 0.004 ? c.copy(colors.primer) : c.copy(colors.primer).lerp(colors.accent, 0.25 + 0.75 * t);
+    };
+  }
+  return null;
+}
+
+// How far each face moved: across the selected step, or from the starting pose to the end.
+// Only defined when both meshes share the same triangles (no Refine or Mirror in between).
+function computeMoved() {
+  if (!state.base || !state.result) return null;
+  const sel = state.selected;
+  let a, b;
+  if (sel >= 0) {
+    a = evaluate(state.base, state.ops, sel, state.cache).mesh;
+    b = evaluate(state.base, state.ops, sel + 1, state.cache).mesh;
+  } else {
+    a = evaluate(state.base, state.ops, ghostIndex(), state.cache).mesh;
+    b = state.result.mesh;
+  }
+  if (a.indices !== b.indices || a.positions.length !== b.positions.length) {
+    return { faces: new Float32Array(0), max: 0, unavailable: true };
+  }
+  const nv = a.positions.length / 3, d = new Float32Array(nv);
+  for (let v = 0; v < nv; v++) {
+    const dx = b.positions[3 * v] - a.positions[3 * v], dy = b.positions[3 * v + 1] - a.positions[3 * v + 1], dz = b.positions[3 * v + 2] - a.positions[3 * v + 2];
+    d[v] = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+  const I = b.indices, nf = I.length / 3, faces = new Float32Array(nf);
+  let max = 0;
+  for (let f = 0; f < nf; f++) {
+    const m = Math.max(d[I[3 * f]], d[I[3 * f + 1]], d[I[3 * f + 2]]);
+    faces[f] = m;
+    if (m > max) max = m;
+  }
+  return { faces, max, unavailable: false };
+}
+
+function geometryFor(mesh, colorFn) {
   const P = mesh.positions, I = mesh.indices, nf = I.length / 3;
   const pos = new Float32Array(nf * 9);
   for (let f = 0; f < nf; f++) {
@@ -231,11 +291,11 @@ function geometryFor(mesh, heat) {
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   g.computeVertexNormals();
-  if (heat) {
+  if (colorFn) {
     const col = new Float32Array(nf * 9);
     const c = new THREE.Color();
     for (let f = 0; f < nf; f++) {
-      heatColor(mesh.strain[f], c);
+      colorFn(f, c);
       for (let k = 0; k < 3; k++) { col[f * 9 + k * 3] = c.r; col[f * 9 + k * 3 + 1] = c.g; col[f * 9 + k * 3 + 2] = c.b; }
     }
     g.setAttribute('color', new THREE.BufferAttribute(col, 3));
@@ -245,11 +305,12 @@ function geometryFor(mesh, heat) {
 }
 
 function updateMesh(mesh) {
-  const key = { mesh, heat: state.view.strain };
-  if (shownKey && shownKey.mesh === mesh && shownKey.heat === key.heat) return;
+  const key = { mesh, heat: state.view.heat, moved: state.view.heat === 'moved' ? state.moved : null };
+  if (shownKey && shownKey.mesh === mesh && shownKey.heat === key.heat && shownKey.moved === key.moved) return;
   shownKey = key;
   if (bodyMesh) { meshGroup.remove(bodyMesh); bodyMesh.geometry.dispose(); }
-  bodyMesh = new THREE.Mesh(geometryFor(mesh, key.heat), key.heat ? heatMat : bodyMat);
+  const colorFn = faceColorFn(mesh);
+  bodyMesh = new THREE.Mesh(geometryFor(mesh, colorFn), colorFn ? heatMat : bodyMat);
   meshGroup.add(bodyMesh);
   const bb = bbox(mesh);
   matGroup.position.z = bb.min[2] - 0.3;
@@ -263,16 +324,24 @@ function ghostIndex() {
   while (g < state.ops.length && SETUP_TYPES.has(state.ops[g].type)) g++;
   return g;
 }
+// The starting pose: the model after the leading setup steps (rotate, refine, pin).
+// Size deltas in the readout are measured against it.
 function ghostMesh() {
   return evaluate(state.base, state.ops, ghostIndex(), state.cache).mesh;
 }
+// The Before outline: the selected step's input, so you see what that one step did;
+// with nothing selected, the starting pose.
+function outlineMesh() {
+  if (state.selected >= 0 && !state.pick) return evaluate(state.base, state.ops, state.selected, state.cache).mesh;
+  return ghostMesh();
+}
 function updateGhost(force) {
   if (!state.view.ghost || !state.base) { if (ghostGroup.children.length) disposeGroup(ghostGroup); ghostKey = null; return; }
-  const m = ghostMesh();
+  const m = outlineMesh();
   if (!force && ghostKey === m) return;
   ghostKey = m;
   disposeGroup(ghostGroup);
-  const g = geometryFor(m, false);
+  const g = geometryFor(m, null);
   const edges = new THREE.LineSegments(new THREE.EdgesGeometry(g, 28),
     new THREE.LineBasicMaterial({ color: colors.accent, transparent: true, opacity: 0.6, depthTest: false }));
   edges.renderOrder = 5;
@@ -341,27 +410,79 @@ function regionOverlay(region, bb, m) {
   return grp;
 }
 
+// Drag grips: spheres drawn on top of everything; dragging one moves its value along its axis.
+let grips = [];
+let hoverGrip = null;
+function addGrip(pos, color, size, g) {
+  const grp = new THREE.Group();
+  grp.position.set(...pos);
+  // Opaque on purpose: transparent materials draw after opaque ones and would cover the ball.
+  const halo = new THREE.Mesh(new THREE.SphereGeometry(size * 1.45, 20, 14),
+    new THREE.MeshBasicMaterial({ color: colors.stage, depthTest: false, side: THREE.BackSide }));
+  halo.renderOrder = 8;
+  const ball = new THREE.Mesh(new THREE.SphereGeometry(size, 20, 14), new THREE.MeshBasicMaterial({ color, depthTest: false }));
+  ball.renderOrder = 9;
+  // A short stroke along the drag axis shows which way the grip moves.
+  const p = [0, 0, 0, 0, 0, 0];
+  p[g.axis] = -size * 3.2; p[g.axis + 3] = size * 3.2;
+  const lg = new THREE.BufferGeometry();
+  lg.setAttribute('position', new THREE.Float32BufferAttribute(p, 3));
+  const stroke = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color, depthTest: false }));
+  stroke.renderOrder = 9;
+  grp.add(halo, stroke, ball);
+  ball.userData.grip = g;
+  if (hoverGrip && hoverGrip.i === g.i && hoverGrip.path === g.path) ball.scale.setScalar(1.3);
+  grips.push(ball);
+  overlay.add(grp);
+}
+
+function dot(p, size, color) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(size, 16, 12), new THREE.MeshBasicMaterial({ color, depthTest: false }));
+  m.position.set(...p);
+  m.renderOrder = 7;
+  return m;
+}
+
 function updateOverlays() {
   disposeGroup(overlay);
+  grips = [];
   const r = state.result;
   if (!r) return;
   const sel = state.selected;
   const op = sel >= 0 ? state.ops[sel] : null;
-  const t = sel >= 0 ? r.trace[sel] : null;
+  const t = sel >= 0 && state.info ? state.info.trace[sel] : null;
   const bb = t ? t.bbox : bbox(r.mesh);
   const pins = t ? t.pins : r.pins;
   for (const p of pins) overlay.add(boxMesh(p.min, p.max, colors.tape, 0.18, 0.9));
-  if (state.clickPoint) {
-    const s = Math.max(...bb.size) * 0.006 + 0.35;
-    const dot = new THREE.Mesh(new THREE.SphereGeometry(s, 16, 12), new THREE.MeshBasicMaterial({ color: colors.accent, depthTest: false }));
-    dot.position.set(...state.clickPoint);
-    dot.renderOrder = 7;
-    overlay.add(dot);
+  const big = Math.max(...bb.size);
+  const dotSize = big * 0.006 + 0.35;
+  if (state.clickPoint) overlay.add(dot(state.clickPoint, dotSize, colors.accent));
+  if (state.clickPoint && state.clickPoint2) {
+    overlay.add(dot(state.clickPoint2, dotSize, colors.accent));
+    const lg = new THREE.BufferGeometry();
+    lg.setAttribute('position', new THREE.Float32BufferAttribute([...state.clickPoint, ...state.clickPoint2], 3));
+    const line = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: colors.accent, depthTest: false }));
+    line.renderOrder = 7;
+    overlay.add(line);
   }
   if (!op || op.enabled === false) return;
-  const m = Math.max(...bb.size) * 0.06 + 3;
-  const big = Math.max(...bb.size);
+  const m = big * 0.06 + 3;
+  const gs = big * 0.012 + 0.7;
+  const showGrips = !state.pick;
+  const up = (a) => (a !== 2 ? 2 : 1); // the axis a plane's grip tab sits along, at the top edge
   const alen = (amt) => Math.min(Math.max(Math.abs(amt) * 3, big * 0.06), big * 0.25);
+  const regionGrips = (reg) => {
+    if (!showGrips || !reg) return;
+    const c = regionCenter(reg, bb);
+    for (let k = 0; k < 3; k++) {
+      for (const side of ['min', 'max']) {
+        const v = reg[side][k];
+        if (v === null || v === '') continue;
+        const p = [...c]; p[k] = +v;
+        addGrip(p, colors.ink, gs * 0.8, { i: sel, path: `region.${side}.${k}`, axis: k, label: `Region ${AX(AXN[k])} ${side === 'min' ? 'from' : 'to'}` });
+      }
+    }
+  };
   switch (op.type) {
     case 'pin': overlay.add(boxMesh(pinBox(op).min, pinBox(op).max, colors.tape, 0.35, 1)); break;
     case 'stretch':
@@ -370,6 +491,10 @@ function updateOverlays() {
       if (a === undefined) break;
       const at = n0(op.at), band = Math.max(0, n0(op.band));
       overlay.add(quad(a, at, bb, m, colors.axes[a], 0.16));
+      if (showGrips) {
+        const p = regionCenter(op.region, bb); p[a] = at; p[up(a)] = bb.max[up(a)] + m * 0.6;
+        addGrip(p, colors.axes[a], gs, { i: sel, path: 'at', axis: a, label: `Split plane ${AX(op.axis)}` });
+      }
       if (band > 0) {
         const lo = bb.min.map((v) => v - m), hi = bb.max.map((v) => v + m);
         lo[a] = at - band; hi[a] = at + band;
@@ -390,9 +515,17 @@ function updateOverlays() {
       if (op.type === 'taper' && b !== undefined && b !== a) {
         overlay.add(quad(b, n0(op.from), bb, m * 0.5, colors.axes[b], 0.06));
         overlay.add(quad(b, n0(op.to), bb, m * 0.5, colors.axes[b], 0.06));
+        if (showGrips) {
+          const w = [0, 1, 2].find((k) => k !== a && k !== b);
+          for (const key of ['from', 'to']) {
+            const p = regionCenter(op.region, bb); p[a] = at; p[b] = n0(op[key]); p[w] = bb.max[w] + m * 0.35;
+            addGrip(p, colors.axes[b], gs * 0.85, { i: sel, path: key, axis: b, label: `Taper ${key} (${AX(op.along)})` });
+          }
+        }
       }
       const ro = regionOverlay(op.region, bb, m);
       if (ro) overlay.add(ro);
+      regionGrips(op.region);
       break;
     }
     case 'move': {
@@ -404,6 +537,7 @@ function updateOverlays() {
       if (amt) overlay.add(arrow(c, a, amt > 0 ? 1 : -1, alen(amt), colors.accent));
       const ro = regionOverlay(reg, bb, m);
       if (ro) overlay.add(ro);
+      regionGrips(reg);
       break;
     }
     case 'mirror': {
@@ -411,6 +545,10 @@ function updateOverlays() {
       if (a === undefined) break;
       const at = n0(op.at);
       overlay.add(quad(a, at, bb, m, colors.axes[a], 0.2));
+      if (showGrips) {
+        const p = [...bb.center]; p[a] = at; p[up(a)] = bb.max[up(a)] + m * 0.6;
+        addGrip(p, colors.axes[a], gs, { i: sel, path: 'at', axis: a, label: `Mirror plane ${AX(op.axis)}` });
+      }
       const lo = bb.min.map((v) => v - m), hi = bb.max.map((v) => v + m);
       if (op.keep === 'neg') lo[a] = at; else hi[a] = at;
       if (hi[a] > lo[a]) overlay.add(boxMesh(lo, hi, colors.bad, 0.08, 0.2));
@@ -428,26 +566,39 @@ function scheduleEval() {
   requestAnimationFrame(() => { evalQueued = false; runEval(); });
 }
 
+const opsKey = () => JSON.stringify(state.ops);
+const infoFrom = (r) => ({ notes: r.notes, trace: r.trace, out: bbox(r.mesh), n: r.notes.length, key: opsKey() });
+
+let fullTimer = 0;
 function runEval() {
   if (!state.base) return;
   const n = state.ops.length;
-  let upTo = state.selected >= 0 ? state.selected + 1 : n;
-  if (state.pick) upTo = state.pick.i; // pick against the model as this step sees it
+  const through = state.selected >= 0 ? state.selected + 1 : n;
+  // While picking, draw the model as the selected step sees it (its input).
+  const upTo = state.pick ? state.pick.i : through;
   const r = evaluate(state.base, state.ops, upTo, state.cache);
-  if (upTo < n && state.selected >= 0 && !r.trace[state.selected]) {
-    // Picking: still need the selected step's input for overlays.
-    const t = evaluate(state.base, state.ops, state.selected + 1, state.cache);
-    r.trace = t.trace;
-    r.notes = t.notes;
-  }
+  const info = upTo === through ? r : evaluate(state.base, state.ops, through, state.cache);
   state.result = r;
+  state.info = infoFrom(info);
   state.upTo = upTo;
+  clearTimeout(fullTimer);
+  if (through === n) state.full = state.info;
+  else {
+    // Notes for the steps after the selected one, computed once editing pauses.
+    fullTimer = setTimeout(() => {
+      if (!state.base) return;
+      state.full = infoFrom(evaluate(state.base, state.ops, state.ops.length, state.cache));
+      updateNotes();
+    }, 300);
+  }
+  state.moved = state.view.heat === 'moved' ? computeMoved() : null;
   updateMesh(r.mesh);
   updateGhost();
   updateOverlays();
   updateNotes();
   updateReadout();
   scheduleCheck();
+  scheduleSave();
   requestRender();
 }
 
@@ -462,14 +613,35 @@ function scheduleCheck() {
   }, 220);
 }
 
+// What each step reports: its own note (warnings, counts) and how it changed the overall size.
+function noteFor(i) {
+  const op = state.ops[i];
+  if (op.enabled === false) return { text: 'Turned off.', size: '', warn: false };
+  const key = opsKey();
+  const src = state.info && i < state.info.n ? state.info : state.full && state.full.key === key && i < state.full.n ? state.full : null;
+  if (!src) return { text: '', size: '', warn: false };
+  const text = src.notes[i] || '';
+  const warn = /^Error|Nothing moved|holds nothing/.test(text);
+  let size = '';
+  if (!SETUP_TYPES.has(op.type) && !text.startsWith('Error')) {
+    const before = src.trace[i].bbox;
+    const after = i + 1 < src.n ? src.trace[i + 1].bbox : src.out;
+    const parts = [0, 1, 2]
+      .map((k) => ({ k, d: after.size[k] - before.size[k] }))
+      .filter(({ d }) => Math.abs(d) >= 0.05)
+      .map(({ k, d }) => `<span class="ax-${AXN[k]}">${AX(AXN[k])}</span> ${signed(d)}`);
+    size = parts.length ? `${parts.join(' · ')} mm` : 'Outer size unchanged';
+  }
+  return { text, size, warn };
+}
+
 function updateNotes() {
-  const notes = state.result ? state.result.notes : [];
   state.ops.forEach((op, i) => {
     const el = document.getElementById('note-' + i);
     if (!el) return;
-    const note = op.enabled === false ? 'Turned off.' : notes[i] ?? '';
-    el.textContent = note;
-    el.classList.toggle('err', note.startsWith('Error'));
+    const { text, size, warn } = noteFor(i);
+    el.innerHTML = [size && `<span class="num">${size}</span>`, text && `<span>${esc(text)}</span>`].filter(Boolean).join(' ');
+    el.classList.toggle('err', warn);
   });
 }
 
@@ -495,15 +667,26 @@ function updateReadout() {
   if (!c) parts.push('<span class="chip wait">Checking</span>');
   else if (c.watertight) parts.push('<span class="chip good">Watertight</span>');
   else parts.push(`<span class="chip bad" title="${c.boundary} open, ${c.nonManifold} non-manifold, ${c.flipped} flipped edges">${(c.boundary + c.nonManifold + c.flipped).toLocaleString()} problem edges</span>`);
-  if (state.view.strain) {
+  if (state.view.heat === 'strain') {
     let mx = 0;
     for (const s of r.mesh.strain) if (s > mx) mx = s;
     parts.push(`<span class="legend"><span>0</span><i></i><span>30%+</span><span class="num">max ${mx > 1 ? 'over 100' : Math.round(mx * 100)}%</span></span>`);
+  } else if (state.view.heat === 'moved') {
+    const mv = state.moved;
+    const scope = state.selected >= 0 ? `step ${state.selected + 1}` : 'all steps';
+    if (!mv || mv.unavailable) parts.push(`<span>Moved view can’t compare across a Refine or Mirror step</span>`);
+    else parts.push(`<span class="legend moved"><span>0</span><i></i><span class="num">${fmtN(mv.max)} mm</span><span>${scope}</span></span>`);
   }
   const n = state.ops.length;
   if (state.pick) parts.push(`<span>Showing the model before step ${state.pick.i + 1}</span>`);
   else if (state.upTo < n) parts.push(`<span>Showing steps 1–${state.upTo} of ${n}</span>`);
-  if (state.clickPoint) parts.push(`<span class="num">Point ${AXN.map((a, k) => `<span class="ax-${a}">${a.toUpperCase()}</span> ${fmtN(state.clickPoint[k])}`).join(' ')}</span>`);
+  const pt = (p) => AXN.map((a, k) => `<span class="ax-${a}">${a.toUpperCase()}</span> ${fmtN(p[k])}`).join(' ');
+  if (state.clickPoint && state.clickPoint2) {
+    const d = [0, 1, 2].map((k) => state.clickPoint2[k] - state.clickPoint[k]);
+    parts.push(`<span class="num">Distance <b>${fmtN(Math.hypot(...d))}</b> mm (${AXN.map((a, k) => `<span class="ax-${a}">Δ${a.toUpperCase()}</span> ${fmtN(Math.abs(d[k]))}`).join(' ')})</span>`);
+  } else if (state.clickPoint) {
+    parts.push(`<span class="num">Point ${pt(state.clickPoint)}</span><span class="hintline">Shift-click a second point to measure</span>`);
+  }
   el.innerHTML = parts.join('');
 }
 
@@ -553,6 +736,9 @@ const ICON = {
   off: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8z"/><path d="M2.5 13.5l11-11"/></svg>',
   del: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5"/></svg>',
   pick: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="4.5"/><path d="M8 1v3.5M8 11.5V15M1 8h3.5M11.5 8H15"/></svg>',
+  dup: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h.5"/></svg>',
+  undo: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M5.5 3L2.5 6l3 3"/><path d="M2.5 6h7a4 4 0 0 1 0 8H7"/></svg>',
+  redo: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10.5 3l3 3-3 3"/><path d="M13.5 6h-7a4 4 0 0 0 0 8H9"/></svg>',
 };
 
 function pickBtn(i, target, label) {
@@ -568,24 +754,24 @@ function fieldsFor(op, i) {
   const seg = (key, label, opts) => `<div class="field"><span class="flabel">${label}</span><div class="seg" role="group" aria-label="${label}">${opts
     .map(([v, t]) => `<button type="button" data-set="${key}" data-val="${v}" data-num="${typeof v === 'number'}" data-i="${i}" aria-pressed="${op[key] === v}">${t}</button>`)
     .join('')}</div></div>`;
-  const num = (key, label, o = {}) => `<div class="field"><label class="flabel" for="${id(key)}">${label}</label><span class="numwrap"><input id="${id(key)}" type="number" step="${o.step ?? 0.5}" ${o.min !== undefined ? `min="${o.min}"` : ''} value="${fmtIn(op[key])}" data-path="${key}" data-i="${i}"><span class="unit">mm</span>${o.pick ? pickBtn(i, o.pick, label) : '<span class="pick-spacer"></span>'}</span>${o.hint ? `<div class="fhint">${o.hint}</div>` : ''}</div>`;
+  const num = (key, label, o = {}) => `<div class="field"><label class="flabel scrub" for="${id(key)}" title="Drag sideways to adjust">${label}</label><span class="numwrap"><input id="${id(key)}" type="number" step="${o.step ?? 0.5}" ${o.min !== undefined ? `min="${o.min}"` : ''} value="${fmtIn(op[key])}" data-path="${key}" data-i="${i}"><span class="unit">mm</span>${o.pick ? pickBtn(i, o.pick, label) : '<span class="pick-spacer"></span>'}</span>${o.hint ? `<div class="fhint">${o.hint}</div>` : ''}</div>`;
   const vec = (key, label, pick) => `<div class="field"><span class="flabel">${label}</span><div class="vec">${[0, 1, 2]
     .map((k) => `<input class="ax-${AXN[k]}-line" id="${id(key + k)}" type="number" step="0.5" value="${fmtIn(op[key][k])}" data-path="${key}.${k}" data-i="${i}" aria-label="${label} ${AXN[k].toUpperCase()}" title="${AXN[k].toUpperCase()}">`)
     .join('')}${pick ? pickBtn(i, 'center', label) : '<span></span>'}</div></div>`;
 
   switch (op.type) {
     case 'rotate': return axisSeg('axis', 'About') + seg('turns', 'Turn', [[1, '90°'], [2, '180°'], [3, '270°']]);
-    case 'refine': return num('maxEdge', 'Max edge', { min: 0.2, hint: 'Splits long triangles so blends have vertices to bend. Shape is unchanged.' });
-    case 'pin': return vec('center', 'Centre', true) + vec('size', 'Size', false) + num('falloff', 'Blend', { hint: 'Everything in the box moves as one piece in later steps. Use it for body-post holes and mounts.' });
+    case 'refine': return num('maxEdge', 'Max edge', { min: 0.2, hint: 'Smaller is smoother but makes a bigger file. 3 mm suits most bodies.' });
+    case 'pin': return vec('center', 'Centre', true) + vec('size', 'Size', false) + num('falloff', 'Blend', { hint: 'Distance around the box over which it eases back into the stretch.' });
     case 'stretch': return axisSeg('axis', 'Axis')
       + num('at', 'Split plane at', { pick: 'at' })
       + num('amount', 'Amount', { hint: 'Total change in length. Negative shrinks.' })
-      + seg('side', 'Moves', [['both', 'Both sides'], ['pos', '+ side'], ['neg', '− side']])
+      + seg('side', 'Moves', [['both', 'Both'], ['pos', '+ side'], ['neg', '− side']])
       + num('band', 'Blend band', { min: 0, hint: '0 slides the halves apart. Wider spreads the stretch over more of the shell.' })
       + regionHtml(op, i);
     case 'taper': return axisSeg('axis', 'Axis')
       + num('at', 'Split plane at', { pick: 'at' })
-      + seg('side', 'Moves', [['both', 'Both sides'], ['pos', '+ side'], ['neg', '− side']])
+      + seg('side', 'Moves', [['both', 'Both'], ['pos', '+ side'], ['neg', '− side']])
       + num('band', 'Blend band', { min: 0 })
       + axisSeg('along', 'Varies along', op.axis)
       + num('from', 'From', { pick: 'from' })
@@ -596,8 +782,7 @@ function fieldsFor(op, i) {
     case 'move': return axisSeg('axis', 'Axis') + num('amount', 'Distance') + regionHtml(op, i);
     case 'mirror': return axisSeg('axis', 'Axis')
       + num('at', 'Mirror plane at', { pick: 'at' })
-      + seg('keep', 'Keep', [['pos', '+ side'], ['neg', '− side']])
-      + '<div class="fhint">Cuts at the plane and reflects the kept half. Good for fixing a lopsided source model.</div>';
+      + seg('keep', 'Keep', [['pos', '+ side'], ['neg', '− side']]);
     default: return '';
   }
 }
@@ -615,26 +800,33 @@ function regionHtml(op, i) {
       + pickBtn(i, 'rmax:' + k, `${a.toUpperCase()} to`) + '</div>';
   }).join('');
   return `<details class="region" data-i="${i}" ${open ? 'open' : ''}><summary>Limit to a region <span class="num" id="rsum-${i}">${esc(regionText(r))}</span></summary><div class="rbody">${rows}`
-    + `<div class="field"><label class="flabel" for="op${i}-rfall">Blend</label><span class="numwrap"><input id="op${i}-rfall" type="number" step="1" min="0" value="${fmtIn(r.falloff)}" data-path="region.falloff" data-i="${i}"><span class="unit">mm</span><span class="pick-spacer"></span></span><div class="fhint">Leave a bound empty for no limit. The step fades out over the blend distance beyond the box.</div></div>`
+    + `<div class="field"><label class="flabel scrub" for="op${i}-rfall" title="Drag sideways to adjust">Blend</label><span class="numwrap"><input id="op${i}-rfall" type="number" step="1" min="0" value="${fmtIn(r.falloff)}" data-path="region.falloff" data-i="${i}"><span class="unit">mm</span><span class="pick-spacer"></span></span><div class="fhint">Leave a bound empty for no limit. The step fades out over the blend distance beyond the box.</div></div>`
     + '</div></details>';
 }
+
+const stepTitle = (op) => (op.label && op.label.trim()) || NAMES[op.type] || op.type;
 
 function renderOp(op, i) {
   const sel = i === state.selected;
   const n = state.ops.length;
+  const named = !!(op.label && op.label.trim());
   return `<li class="op${sel ? ' sel' : ''}${op.enabled === false ? ' off' : ''}">
-    <div class="op-head" data-act="select" data-i="${i}" role="button" tabindex="0" aria-expanded="${sel}">
+    <div class="op-head" data-act="select" data-i="${i}" role="button" tabindex="0" aria-expanded="${sel}" title="${sel ? 'Close this step' : 'Edit this step and show the model up to it'}">
       <span class="op-n">${i + 1}</span>
-      <div class="op-title"><div class="op-name">${NAMES[op.type] || op.type}${op.type === 'pin' ? '<span class="tag">RIGID</span>' : ''}</div><div class="op-sum" id="sum-${i}">${esc(summary(op))}</div></div>
+      <div class="op-title"><div class="op-name" id="title-${i}">${esc(stepTitle(op))}${op.type === 'pin' ? '<span class="tag">RIGID</span>' : ''}</div><div class="op-sum" id="sum-${i}">${named ? `<span class="op-type">${NAMES[op.type]}</span> · ` : ''}${esc(summary(op))}</div></div>
       <div class="op-tools">
-        <button type="button" class="icon" data-act="up" data-i="${i}" aria-label="Move step up" ${i === 0 ? 'disabled' : ''}>${ICON.up}</button>
-        <button type="button" class="icon" data-act="down" data-i="${i}" aria-label="Move step down" ${i === n - 1 ? 'disabled' : ''}>${ICON.down}</button>
+        <button type="button" class="icon" data-act="up" data-i="${i}" aria-label="Move step up" title="Move up" ${i === 0 ? 'disabled' : ''}>${ICON.up}</button>
+        <button type="button" class="icon" data-act="down" data-i="${i}" aria-label="Move step down" title="Move down" ${i === n - 1 ? 'disabled' : ''}>${ICON.down}</button>
+        <button type="button" class="icon" data-act="dup" data-i="${i}" aria-label="Duplicate step" title="Duplicate (Ctrl/⌘+D)">${ICON.dup}</button>
         <button type="button" class="icon" data-act="toggle" data-i="${i}" aria-label="${op.enabled === false ? 'Turn step on' : 'Turn step off'}" title="${op.enabled === false ? 'Turn on' : 'Turn off'}">${op.enabled === false ? ICON.off : ICON.on}</button>
-        <button type="button" class="icon" data-act="del" data-i="${i}" aria-label="Delete step" title="Delete">${ICON.del}</button>
+        <button type="button" class="icon" data-act="del" data-i="${i}" aria-label="Delete step" title="Delete (Del)">${ICON.del}</button>
       </div>
     </div>
     <div class="op-note" id="note-${i}"></div>
-    ${sel ? `<div class="op-body">${fieldsFor(op, i)}</div>` : ''}
+    ${sel ? `<div class="op-body">
+      <p class="op-help">${OPS_HELP[op.type] || ''}</p>
+      <div class="field"><label class="flabel" for="op${i}-label">Name</label><input class="textin" id="op${i}-label" type="text" maxlength="60" placeholder="${NAMES[op.type]}" value="${esc(op.label || '')}" data-kind="label" data-i="${i}"></div>
+      ${fieldsFor(op, i)}</div>` : ''}
   </li>`;
 }
 
@@ -645,10 +837,41 @@ function orientationNotice() {
   return `<div class="notice"><span>This model is taller than it is long, so it may be stood on end for printing. Lay it down so Y runs nose to tail?</span><button type="button" class="btn" data-act="layflat">Add Rotate X 90°</button></div>`;
 }
 
+// Top view of a body split at a plane: the halves slide apart and only the strip between them stretches.
+const INTRO_DIAGRAM = `<svg class="intro-fig" viewBox="0 0 320 96" role="img" aria-label="Diagram: a body seen from above is cut at a split plane. The two halves slide apart, and only the strip between them stretches.">
+  <rect x="80" y="22" width="160" height="52" rx="16" fill="none" stroke="var(--muted)" stroke-dasharray="4 4"/>
+  <path d="M164 22 H82 a16 16 0 0 0 -16 16 v20 a16 16 0 0 0 16 16 H164" transform="translate(-14 0)" fill="var(--primer)" fill-opacity=".55" stroke="var(--ink)" stroke-width="1.2"/>
+  <path d="M156 22 H238 a16 16 0 0 1 16 16 v20 a16 16 0 0 1 -16 16 H156" transform="translate(14 0)" fill="var(--primer)" fill-opacity=".55" stroke="var(--ink)" stroke-width="1.2"/>
+  <rect x="150" y="22" width="20" height="52" fill="var(--heat-mid)" fill-opacity=".55"/>
+  <line x1="160" y1="8" x2="160" y2="88" stroke="var(--ax-x)" stroke-width="1.6" stroke-dasharray="5 3"/>
+  <path d="M128 48 h-28 m6 -5 l-6 5 6 5 M192 48 h28 m-6 -5 l6 5 -6 5" fill="none" stroke="var(--accent)" stroke-width="2"/>
+  <text x="166" y="14" font-size="10" fill="var(--muted)">split plane</text>
+  <text x="160" y="94" font-size="10" fill="var(--muted)" text-anchor="middle">only this strip stretches</text>
+  <text x="80" y="16" font-size="10" fill="var(--muted)">before</text>
+</svg>`;
+
+function introHtml() {
+  if (!state.showIntro) return '';
+  const sample = state.fileName === 'sample-pickup.stl';
+  return `<section class="intro" aria-label="How Panelbeater works">
+    <div class="intro-head"><h2 class="sec-title">How it works</h2><button type="button" class="icon" data-act="intro-close" aria-label="Close" title="Close">✕</button></div>
+    ${INTRO_DIAGRAM}
+    <ol class="intro-steps">
+      <li><b>Open an STL or 3MF.</b> It sits centred on the mat, and every number is in millimetres.</li>
+      <li><b>Add steps.</b> They run top to bottom. Click one to edit it; the view then shows the model up to that step.</li>
+      <li><b>Drag the coloured grips or type numbers.</b> The line under each step says what it changed.</li>
+      <li><b>Export STL</b> once the readout says Watertight.</li>
+    </ol>
+    <p class="hint">${sample ? 'This sample truck already has six named steps. Click through them to see what each one does.' : 'Your steps and model are saved in this browser, so a reload picks up where you left off.'}</p>
+    <div class="intro-actions"><button type="button" class="btn" data-act="intro-close">Got it</button>${sample ? '' : '<button type="button" class="btn" data-act="sample">Open the sample truck</button>'}</div>
+  </section>`;
+}
+
 function renderPanel() {
-  const add = (t, label) => `<button type="button" class="add" data-add="${t}">+ ${label}</button>`;
+  const add = (t, label) => `<button type="button" class="add" data-add="${t}" title="${esc(OPS_HELP[t])}">+ ${label}</button>`;
   const ops = state.ops;
   $('#panel').innerHTML = `
+    ${introHtml()}
     <div class="addbar">
       <h2 class="sec-title">Add a step</h2>
       <div class="addrow"><span class="lbl">Set up</span>${add('rotate', 'Rotate')}${add('refine', 'Refine')}${add('pin', 'Pin')}</div>
@@ -656,14 +879,29 @@ function renderPanel() {
     </div>
     ${orientationNotice()}
     <section>
-      <h2 class="sec-title steps-title">Steps <span class="num">${ops.length}</span></h2>
+      <div class="steps-head">
+        <h2 class="sec-title">Steps <span class="num">${ops.length}</span></h2>
+        <div class="hist">
+          <button type="button" class="icon" id="btn-undo" data-act="undo" aria-label="Undo" title="Undo (Ctrl/⌘+Z)">${ICON.undo}</button>
+          <button type="button" class="icon" id="btn-redo" data-act="redo" aria-label="Redo" title="Redo (Ctrl/⌘+Shift+Z)">${ICON.redo}</button>
+        </div>
+      </div>
       ${ops.length ? `<ol class="ops">${ops.map(renderOp).join('')}</ol>` : '<p class="hint">No steps yet. Each step applies to the whole model unless you limit it to a region.</p>'}
     </section>
     <div class="foot">
-      <span>Millimetres. X and Y are centred on the model and it sits on Z&nbsp;=&nbsp;0. New steps go after the selected one.</span>
-      <span>Drag to orbit, right-drag to pan, scroll to zoom. Click the model to read a point. <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Z</kbd> undoes, <kbd>Esc</kbd> deselects.</span>
+      <span>Millimetres. X and Y are centred on the model; it sits on Z&nbsp;=&nbsp;0. New steps go after the selected one. Work is saved in this browser.</span>
+      <dl class="keys">
+        <dt>Click</dt><dd>read a point · <kbd>Shift</kbd>-click to measure</dd>
+        <dt>Double-click</dt><dd>orbit around that point</dd>
+        <dt>Drag a field label</dt><dd>scrub its value · <kbd>↑</kbd><kbd>↓</kbd> step it (<kbd>Shift</kbd> ×10, <kbd>Alt</kbd> fine)</dd>
+        <dt><kbd>F</kbd></dt><dd>fit the model in view</dd>
+        <dt><kbd>Ctrl</kbd>/<kbd>⌘</kbd></dt><dd><kbd>Z</kbd> undo · <kbd>Shift</kbd>+<kbd>Z</kbd> redo · <kbd>D</kbd> duplicate step</dd>
+        <dt><kbd>Del</kbd> · <kbd>Esc</kbd></dt><dd>delete · close the selected step</dd>
+      </dl>
+      <button type="button" class="linkbtn" data-act="sample">Start over with the sample truck</button>
     </div>`;
   updateNotes();
+  updateHistoryButtons();
 }
 
 /* --------------------------------------------------------------- editing */
@@ -684,8 +922,11 @@ function setPath(op, path, raw) {
 
 function refreshCardText(i) {
   const op = state.ops[i];
+  const named = !!(op.label && op.label.trim());
   const s = document.getElementById('sum-' + i);
-  if (s) s.textContent = summary(op);
+  if (s) s.innerHTML = `${named ? `<span class="op-type">${NAMES[op.type]}</span> · ` : ''}${esc(summary(op))}`;
+  const t = document.getElementById('title-' + i);
+  if (t) t.innerHTML = esc(stepTitle(op)) + (op.type === 'pin' ? '<span class="tag">RIGID</span>' : '');
   const rs = document.getElementById('rsum-' + i);
   if (rs) rs.textContent = regionText(op.region);
 }
@@ -785,11 +1026,25 @@ panel.addEventListener('click', (e) => {
   } else if (act === 'toggle') {
     ops[i].enabled = ops[i].enabled === false;
   } else if (act === 'del') {
-    ops.splice(i, 1);
-    if (state.selected >= ops.length) state.selected = ops.length - 1;
-    if (state.selected === i) state.selected = -1;
-    else if (state.selected > i) state.selected--;
-    cancelPick(false);
+    deleteStep(i);
+    return;
+  } else if (act === 'dup') {
+    duplicateStep(i);
+    return;
+  } else if (act === 'undo') {
+    undo();
+    return;
+  } else if (act === 'redo') {
+    redo();
+    return;
+  } else if (act === 'intro-close') {
+    state.showIntro = false;
+    try { localStorage.setItem('pb.intro', 'seen'); } catch {}
+    renderPanel();
+    return;
+  } else if (act === 'sample') {
+    loadSample();
+    return;
   } else if (act === 'layflat') {
     ops.unshift({ ...defaultOp('rotate'), axis: 'x', turns: 1 });
     if (state.selected >= 0) state.selected++;
@@ -803,6 +1058,14 @@ panel.addEventListener('keydown', (e) => {
 });
 panel.addEventListener('input', (e) => {
   const t = e.target;
+  if (t.dataset.kind === 'label') {
+    const op = state.ops[+t.dataset.i];
+    if (t.value.trim()) op.label = t.value; else delete op.label;
+    refreshCardText(+t.dataset.i);
+    record();
+    scheduleSave();
+    return;
+  }
   if (!t.matches('input[data-path]')) return;
   const i = +t.dataset.i;
   if (!setPath(state.ops[i], t.dataset.path, t.value)) return;
@@ -810,6 +1073,81 @@ panel.addEventListener('input', (e) => {
   record();
   scheduleEval();
 });
+
+// Set a number field from code (keys, scrubbing, grips) and run it through the normal input path.
+function nudgeInput(input, value) {
+  const step = parseFloat(input.step) || 0.5;
+  const decimals = step < 0.5 ? 2 : 1;
+  let v = Math.round(value * 10 ** decimals) / 10 ** decimals;
+  if (input.min !== '' && v < +input.min) v = +input.min;
+  input.value = String(v);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+const multiplier = (e) => (e.shiftKey ? 10 : e.altKey ? 0.2 : 1);
+
+panel.addEventListener('keydown', (e) => {
+  const t = e.target;
+  if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && t.matches('input[type="number"][data-path]')) {
+    e.preventDefault();
+    const step = parseFloat(t.step) || 0.5;
+    const cur = t.value === '' ? 0 : +t.value;
+    nudgeInput(t, cur + (e.key === 'ArrowUp' ? 1 : -1) * step * multiplier(e));
+  }
+});
+
+// Drag left/right on a field's label to scrub its value: 6 px per step, Shift ×10, Alt fine.
+let scrub = null;
+panel.addEventListener('pointerdown', (e) => {
+  const label = e.target.closest('label.flabel[for]');
+  if (!label || e.button !== 0) return;
+  const input = document.getElementById(label.htmlFor);
+  if (!input || input.type !== 'number' || !input.dataset.path) return;
+  scrub = { input, x: e.clientX, start: input.value === '' ? 0 : +input.value, moved: false, id: e.pointerId };
+  label.setPointerCapture(e.pointerId);
+});
+panel.addEventListener('pointermove', (e) => {
+  if (!scrub || e.pointerId !== scrub.id) return;
+  const dx = e.clientX - scrub.x;
+  if (!scrub.moved && Math.abs(dx) < 3) return;
+  if (!scrub.moved) { scrub.moved = true; document.body.classList.add('scrubbing'); }
+  const step = parseFloat(scrub.input.step) || 0.5;
+  nudgeInput(scrub.input, scrub.start + Math.round(dx / 6) * step * multiplier(e));
+});
+const endScrub = (e) => {
+  if (!scrub || (e && e.pointerId !== scrub.id)) return;
+  if (scrub.moved) { document.body.classList.remove('scrubbing'); record(true); }
+  else scrub.input.focus();
+  scrub = null;
+};
+panel.addEventListener('pointerup', endScrub);
+panel.addEventListener('pointercancel', endScrub);
+
+function deleteStep(i) {
+  const ops = state.ops;
+  if (i < 0 || i >= ops.length) return;
+  const name = stepTitle(ops[i]);
+  ops.splice(i, 1);
+  if (state.selected === i) state.selected = -1;
+  else if (state.selected > i) state.selected--;
+  cancelPick(false);
+  record(true);
+  renderPanel();
+  scheduleEval();
+  toast(`Deleted “${name}”. Ctrl/⌘+Z brings it back.`);
+}
+
+function duplicateStep(i) {
+  const ops = state.ops;
+  if (i < 0 || i >= ops.length) return;
+  const copy = JSON.parse(JSON.stringify(ops[i]));
+  if (copy.label) copy.label = `${copy.label} (copy)`;
+  ops.splice(i + 1, 0, copy);
+  state.selected = i + 1;
+  cancelPick(false);
+  record(true);
+  renderPanel();
+  scheduleEval();
+}
 panel.addEventListener('toggle', (e) => {
   if (e.target.matches('details.region')) state.regionOpen.set(state.ops[+e.target.dataset.i], e.target.open);
 }, true);
@@ -827,6 +1165,13 @@ function commit() {
   history.stack.push(s);
   if (history.stack.length > 300) history.stack.shift();
   history.index = history.stack.length - 1;
+  updateHistoryButtons();
+  scheduleSave();
+}
+function updateHistoryButtons() {
+  const u = document.getElementById('btn-undo'), r = document.getElementById('btn-redo');
+  if (u) u.disabled = history.index <= 0 && !history.timer;
+  if (r) r.disabled = history.index >= history.stack.length - 1;
 }
 function record(now = false) {
   clearTimeout(history.timer);
@@ -839,6 +1184,7 @@ function restore(s) {
   cancelPick(false);
   renderPanel();
   scheduleEval();
+  scheduleSave();
 }
 function undo() {
   if (history.timer) commit();
@@ -855,51 +1201,184 @@ function resetHistory() {
 
 window.addEventListener('keydown', (e) => {
   const mod = e.metaKey || e.ctrlKey;
-  if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
-  if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
+  const typing = e.target.matches('input, textarea, select, [contenteditable]');
+  const key = e.key.toLowerCase();
+  if (mod && key === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+  if (mod && key === 'y') { e.preventDefault(); redo(); return; }
+  if (mod && key === 'd' && state.selected >= 0) { e.preventDefault(); duplicateStep(state.selected); return; }
   if (e.key === 'Escape') {
+    if (drag) return;
     if (state.pick) cancelPick();
-    else if (state.selected >= 0 && !e.target.matches('input')) { state.selected = -1; renderPanel(); scheduleEval(); }
+    else if (state.selected >= 0 && !typing) { state.selected = -1; renderPanel(); scheduleEval(); }
+    return;
   }
+  if (typing || mod || e.altKey) return;
+  if ((e.key === 'Delete' || e.key === 'Backspace') && state.selected >= 0) { e.preventDefault(); deleteStep(state.selected); return; }
+  if (key === 'f') { frameView('keep'); }
 });
 
 /* ------------------------------------------------------------ viewport io */
 
 const raycaster = new THREE.Raycaster();
+const ndcOf = (e) => {
+  const r = canvas.getBoundingClientRect();
+  return new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+};
+function hitModel(e) {
+  if (!bodyMesh) return null;
+  raycaster.setFromCamera(ndcOf(e), camera);
+  const hit = raycaster.intersectObject(bodyMesh, false)[0];
+  return hit ? [hit.point.x, hit.point.y, hit.point.z] : null;
+}
+function gripAt(e) {
+  if (!grips.length) return null;
+  raycaster.setFromCamera(ndcOf(e), camera);
+  const hit = raycaster.intersectObjects(grips, false)[0];
+  return hit ? hit.object : null;
+}
+// Where along the axis line through `origin` the mouse ray passes closest. Null when the
+// axis points straight at the camera and can't be dragged along.
+function axisParam(e, origin, axis) {
+  raycaster.setFromCamera(ndcOf(e), camera);
+  const O = raycaster.ray.origin, D = raycaster.ray.direction;
+  const A = new THREE.Vector3(); A.setComponent(axis, 1);
+  const w0 = origin.clone().sub(O);
+  const b = A.dot(D), d = A.dot(w0), e2 = D.dot(w0);
+  const denom = 1 - b * b;
+  return denom < 1e-3 ? null : (b * e2 - d) / denom;
+}
+const getPath = (op, path) => path.split('.').reduce((o, k) => (o == null ? o : o[k]), op);
+const inputIdFor = (i, path) => {
+  const m = path.match(/^region\.(min|max)\.(\d)$/);
+  return m ? `op${i}-r${m[1]}${m[2]}` : `op${i}-${path}`;
+};
+
+const tip = document.createElement('div');
+tip.className = 'griptip';
+tip.hidden = true;
+stage.append(tip);
+
+let drag = null;
 let downAt = null;
+
+// Grips are grabbed in the capture phase so the orbit controls never see the press.
+stage.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || !renderer || e.target !== canvas) return;
+  const obj = gripAt(e);
+  if (!obj) return;
+  const g = obj.userData.grip;
+  const origin = obj.getWorldPosition(new THREE.Vector3());
+  const t0 = axisParam(e, origin, g.axis);
+  e.stopPropagation();
+  e.preventDefault();
+  if (t0 === null) { toast(`Turn the view a little to drag along ${AX(AXN[g.axis])}.`); return; }
+  drag = { g, origin, t0, start: n0(getPath(state.ops[g.i], g.path)), id: e.pointerId };
+  if (controls) controls.enabled = false;
+  stage.setPointerCapture(e.pointerId);
+  stage.classList.add('dragging');
+}, true);
+
+window.addEventListener('pointermove', (e) => {
+  if (drag) {
+    if (e.pointerId !== drag.id) return;
+    const t = axisParam(e, drag.origin, drag.g.axis);
+    if (t === null) return;
+    const snap = e.shiftKey ? 0.1 : 0.5;
+    const v = Math.round((Math.round((drag.start + (t - drag.t0)) / snap) * snap) * 100) / 100;
+    const op = state.ops[drag.g.i];
+    if (n0(getPath(op, drag.g.path)) !== v || getPath(op, drag.g.path) === null) {
+      setPath(op, drag.g.path, String(v));
+      const input = document.getElementById(inputIdFor(drag.g.i, drag.g.path));
+      if (input) input.value = String(v);
+      refreshCardText(drag.g.i);
+      scheduleEval();
+    }
+    const r = stage.getBoundingClientRect();
+    tip.textContent = `${drag.g.label}: ${shortN(v)} mm`;
+    tip.style.left = `${e.clientX - r.left + 14}px`;
+    tip.style.top = `${e.clientY - r.top + 14}px`;
+    tip.hidden = false;
+    return;
+  }
+  // Hover feedback for grips (only when no button is held, over the canvas).
+  if (e.target !== canvas || e.buttons) return;
+  const obj = gripAt(e);
+  const g = obj ? obj.userData.grip : null;
+  const same = (a, b) => (a && b ? a.i === b.i && a.path === b.path : a === b);
+  if (same(g, hoverGrip)) return;
+  hoverGrip = g;
+  canvas.style.cursor = g ? 'grab' : '';
+  canvas.title = g ? `${g.label}: drag to move (Shift for 0.1 mm)` : '';
+  for (const o of grips) o.scale.setScalar(same(o.userData.grip, g) ? 1.3 : 1);
+  requestRender();
+});
+
+const endDrag = (e) => {
+  if (!drag || (e && e.pointerId !== drag.id)) return;
+  drag = null;
+  if (controls) controls.enabled = true;
+  stage.classList.remove('dragging');
+  tip.hidden = true;
+  record(true);
+};
+window.addEventListener('pointerup', endDrag);
+window.addEventListener('pointercancel', endDrag);
+
 canvas.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; });
 canvas.addEventListener('pointerup', (e) => {
   if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 4 || e.button !== 0) return;
   downAt = null;
-  if (!bodyMesh) return;
-  const rect = canvas.getBoundingClientRect();
-  const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
-  raycaster.setFromCamera(ndc, camera);
-  const hit = raycaster.intersectObject(bodyMesh, false)[0];
-  if (!hit) {
-    if (!state.pick && state.clickPoint) { state.clickPoint = null; updateOverlays(); updateReadout(); requestRender(); }
+  const p = hitModel(e);
+  if (!p) {
+    if (!state.pick && state.clickPoint) { state.clickPoint = state.clickPoint2 = null; updateOverlays(); updateReadout(); requestRender(); }
     return;
   }
-  const p = [hit.point.x, hit.point.y, hit.point.z];
-  if (state.pick) applyPick(p);
-  else { state.clickPoint = p; updateOverlays(); updateReadout(); requestRender(); }
+  if (state.pick) { applyPick(p); return; }
+  if (e.shiftKey && state.clickPoint) state.clickPoint2 = p;
+  else { state.clickPoint = p; state.clickPoint2 = null; }
+  updateOverlays();
+  updateReadout();
+  requestRender();
+});
+// Double-click the model to orbit around that point.
+canvas.addEventListener('dblclick', (e) => {
+  const p = hitModel(e);
+  if (!p || !controls) return;
+  controls.target.set(...p);
+  controls.update();
+  requestRender();
 });
 
-function toggleView(key, el) {
-  state.view[key] = !state.view[key];
-  el.setAttribute('aria-pressed', String(state.view[key]));
+function setHeat(mode) {
+  state.view.heat = mode;
   syncViewButtons();
-  if (state.result) { updateMesh(state.result.mesh); updateGhost(); updateReadout(); requestRender(); }
+  if (!state.result) return;
+  state.moved = mode === 'moved' ? computeMoved() : null;
+  updateMesh(state.result.mesh);
+  updateReadout();
+  requestRender();
 }
 function syncViewButtons() {
-  $('#v-shaded').setAttribute('aria-pressed', String(!state.view.strain));
-  $('#v-strain').setAttribute('aria-pressed', String(state.view.strain));
+  $('#v-shaded').setAttribute('aria-pressed', String(state.view.heat === 'none'));
+  $('#v-strain').setAttribute('aria-pressed', String(state.view.heat === 'strain'));
+  $('#v-moved').setAttribute('aria-pressed', String(state.view.heat === 'moved'));
   $('#v-ghost').setAttribute('aria-pressed', String(state.view.ghost));
 }
-$('#v-shaded').addEventListener('click', () => { if (state.view.strain) toggleView('strain', $('#v-strain')); });
-$('#v-strain').addEventListener('click', (e) => { if (!state.view.strain) toggleView('strain', e.currentTarget); });
-$('#v-ghost').addEventListener('click', (e) => toggleView('ghost', e.currentTarget));
+$('#v-shaded').addEventListener('click', () => setHeat('none'));
+$('#v-strain').addEventListener('click', () => setHeat('strain'));
+$('#v-moved').addEventListener('click', () => setHeat('moved'));
+$('#v-ghost').addEventListener('click', () => {
+  state.view.ghost = !state.view.ghost;
+  syncViewButtons();
+  updateGhost();
+  requestRender();
+});
 document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => frameView(b.dataset.view)));
+$('#btn-help').addEventListener('click', () => {
+  state.showIntro = !state.showIntro;
+  renderPanel();
+  if (state.showIntro) $('#panel').closest('.panel').scrollTo({ top: 0, behavior: 'smooth' });
+});
 
 /* ------------------------------------------------------------------ files */
 
@@ -919,9 +1398,10 @@ function setLoading(on, msg = 'Loading…') {
 }
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
 
-async function openBuffer(name, buffer, recipe = null) {
+async function openBuffer(name, buffer, recipe = null, { persist = true } = {}) {
   setLoading(true, `Loading ${name}…`);
   await nextFrame();
+  const original = persist ? buffer.slice(0) : null;
   try {
     const mesh = await loadMesh(name, buffer);
     state.base = mesh;
@@ -938,10 +1418,90 @@ async function openBuffer(name, buffer, recipe = null) {
     runEval();
     frameView('iso');
     setLoading(false);
+    if (original) idbPut('model', { name, buffer: original });
+    return true;
   } catch (err) {
     console.error(err);
     setLoading(!state.base, 'Open an STL or 3MF file, or drop one here.');
     toast(`Couldn't open ${name}: ${err.message}`);
+    return false;
+  }
+}
+
+/* --------------------------------------------------------------- session */
+
+// The open model and its steps stay in this browser (IndexedDB), so a reload
+// picks up where you left off. Nothing is uploaded. Every call tolerates
+// storage being blocked (private windows, strict settings): the app just
+// starts fresh next time.
+let dbPromise = null;
+function idb() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve) => {
+      try {
+        const req = indexedDB.open('panelbeater', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('session');
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(null);
+        req.onblocked = () => resolve(null);
+      } catch { resolve(null); }
+    });
+  }
+  return dbPromise;
+}
+async function idbPut(key, value) {
+  const db = await idb();
+  if (!db) return;
+  try {
+    await new Promise((res, rej) => {
+      const tx = db.transaction('session', 'readwrite');
+      tx.objectStore('session').put(value, key);
+      tx.oncomplete = res;
+      tx.onerror = tx.onabort = () => rej(tx.error);
+    });
+  } catch (err) { console.warn('Panelbeater: could not save the session.', err); }
+}
+async function idbGet(key) {
+  const db = await idb();
+  if (!db) return null;
+  try {
+    return await new Promise((res, rej) => {
+      const r = db.transaction('session', 'readonly').objectStore('session').get(key);
+      r.onsuccess = () => res(r.result ?? null);
+      r.onerror = () => rej(r.error);
+    });
+  } catch { return null; }
+}
+
+let saveTimer = 0;
+function scheduleSave() {
+  if (!state.base) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    idbPut('steps', { file: state.fileName, ops: JSON.parse(JSON.stringify(state.ops)), view: { ...state.view } });
+  }, 600);
+}
+
+async function loadSample() {
+  const btn = document.querySelector('.linkbtn[data-act="sample"]');
+  const hasWork = state.base && state.fileName !== 'sample-pickup.stl' && state.ops.length > 1;
+  if (hasWork && btn && btn.dataset.armed !== '1') {
+    // Replacing someone's model can't be undone, so ask for a second click.
+    btn.dataset.armed = '1';
+    btn.textContent = 'This replaces your model. Click again to continue';
+    setTimeout(() => { if (btn.isConnected) { btn.dataset.armed = ''; btn.textContent = 'Start over with the sample truck'; } }, 4000);
+    return;
+  }
+  try {
+    const [stl, recipe] = await Promise.all([
+      fetch('examples/sample-pickup.stl').then((r) => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); }),
+      fetch('examples/sample-pickup.recipe.json').then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); }),
+    ]);
+    state.view.ghost = true;
+    syncViewButtons();
+    await openBuffer('sample-pickup.stl', stl, readRecipe(recipe));
+  } catch {
+    setLoading(!state.base, 'Open an STL or 3MF file, or drop one here.');
   }
 }
 
@@ -1069,16 +1629,38 @@ applyTheme();
 renderPanel();
 downloadsCap();
 
+// Test hook for the browser checks: add ?debug to the URL.
+if (new URLSearchParams(location.search).has('debug')) {
+  window.panelbeater = {
+    state,
+    gripScreen(path) {
+      const o = grips.find((g) => g.userData.grip.path === path);
+      if (!o) return null;
+      const v = o.getWorldPosition(o.position.clone()).project(camera);
+      const r = canvas.getBoundingClientRect();
+      return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height };
+    },
+  };
+}
+
 (async function boot() {
-  try {
-    const [stl, recipe] = await Promise.all([
-      fetch('examples/sample-pickup.stl').then((r) => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); }),
-      fetch('examples/sample-pickup.recipe.json').then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); }),
-    ]);
-    state.view.ghost = true;
-    syncViewButtons();
-    await openBuffer('sample-pickup.stl', stl, readRecipe(recipe));
-  } catch {
-    setLoading(true, 'Open an STL or 3MF file, or drop one here.');
+  try { state.showIntro = localStorage.getItem('pb.intro') !== 'seen'; } catch { state.showIntro = true; }
+  renderPanel();
+  // Pick up the last session if there is one; otherwise open the sample truck.
+  const [model, steps] = await Promise.all([idbGet('model'), idbGet('steps')]);
+  if (model && model.buffer && model.name) {
+    let recipe = null;
+    if (steps && steps.file === model.name && Array.isArray(steps.ops)) {
+      try { recipe = readRecipe({ app: 'panelbeater', version: 1, ops: steps.ops }); } catch { recipe = null; }
+      const v = steps.view || {};
+      if (['none', 'strain', 'moved'].includes(v.heat)) state.view.heat = v.heat;
+      state.view.ghost = !!v.ghost;
+      syncViewButtons();
+    }
+    if (await openBuffer(model.name, model.buffer, recipe, { persist: false })) {
+      toast(`Picked up where you left off: ${model.name}`);
+      return;
+    }
   }
+  await loadSample();
 })();

@@ -271,3 +271,30 @@ test('zipStore output is a readable zip', async () => {
   const out = execFileSync('python3', ['-I', '-c', `import zipfile,sys;z=zipfile.ZipFile(sys.argv[1]);print(z.testzip(),sorted(z.namelist()))`, dir + '/t.zip']).toString();
   assert.match(out, /None \['a.stl', 'r.json'\]/);
 });
+
+test('a step that moves nothing says so', () => {
+  const op = { ...defaultOp('stretch'), amount: 5, region: { min: [null, 500, null], max: [null, null, null], falloff: 0 } };
+  const { notes } = evaluate(base(), [op]);
+  assert.match(notes[0], /Nothing moved/);
+  const ok = evaluate(base(), [{ ...defaultOp('stretch'), amount: 5 }]);
+  assert.doesNotMatch(ok.notes[0], /Nothing moved/);
+});
+
+test('pins report what they hold', () => {
+  const held = evaluate(base(), [{ ...defaultOp('pin'), center: [0, 0, 30], size: [10, 10, 2] }]).notes[0];
+  assert.match(held, /Holds \d+ points/);
+  const empty = evaluate(base(), [{ ...defaultOp('pin'), center: [0, 0, 300], size: [4, 4, 4] }]).notes[0];
+  assert.match(empty, /holds nothing/);
+});
+
+test('step labels survive recipes and do not invalidate the cache', () => {
+  const m = base();
+  const ops = [{ ...defaultOp('refine'), maxEdge: 4 }, { ...defaultOp('stretch'), label: 'Widen nose' }];
+  const cache = [];
+  const a = evaluate(m, ops, ops.length, cache);
+  ops[1] = { ...ops[1], label: 'Wider nose' };
+  const b = evaluate(m, ops, ops.length, cache);
+  assert.equal(a.mesh, b.mesh, 'rename reuses the cached result');
+  const r = readRecipe(JSON.parse(JSON.stringify(makeRecipe(ops))));
+  assert.equal(r.ops[1].label, 'Wider nose');
+});

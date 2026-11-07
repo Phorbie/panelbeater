@@ -1,23 +1,13 @@
 {
   "app": "panelbeater",
   "version": 1,
-  "source": { "name": "sample-pickup.stl", "faces": 1524 },
+  "source": {"name": "sample-pickup.stl", "faces": 1524},
   "ops": [
-    { "type": "refine", "enabled": true, "maxEdge": 3 },
-    { "type": "pin", "enabled": true, "center": [0, -64, 27], "size": [24, 8, 4], "falloff": 3 },
-    { "type": "pin", "enabled": true, "center": [0, 28, 17], "size": [24, 8, 4], "falloff": 3 },
-    {
-      "type": "stretch", "enabled": true, "axis": "x", "at": 0, "amount": 6, "band": 0, "side": "both",
-      "region": { "min": [null, null, null], "max": [null, -42, null], "falloff": 14 }
-    },
-    {
-      "type": "taper", "enabled": true, "axis": "x", "at": 0, "band": 0, "side": "both",
-      "along": "y", "from": 10, "to": 90, "amountFrom": 0, "amountTo": -8,
-      "region": { "min": [null, 8, null], "max": [null, null, null], "falloff": 4 }
-    },
-    {
-      "type": "stretch", "enabled": true, "axis": "z", "at": 10, "amount": 4, "band": 0, "side": "neg",
-      "region": { "min": [null, -40, null], "max": [null, 8, null], "falloff": 8 }
-    }
+    {"type": "refine", "enabled": true, "maxEdge": 3, "label": "Refine for smooth blends"},
+    {"type": "pin", "enabled": true, "center": [0, -64, 27], "size": [24, 8, 4], "falloff": 3, "label": "Pin the hood post holes"},
+    {"type": "pin", "enabled": true, "center": [0, 28, 17], "size": [24, 8, 4], "falloff": 3, "label": "Pin the bed post holes"},
+    {"type": "stretch", "enabled": true, "axis": "x", "at": 0, "amount": 6, "band": 0, "side": "both", "region": {"min": [null, null, null], "max": [null, -42, null], "falloff": 14}, "label": "Widen the nose"},
+    {"type": "taper", "enabled": true, "axis": "x", "at": 0, "band": 0, "side": "both", "along": "y", "from": 10, "to": 90, "amountFrom": 0, "amountTo": -8, "region": {"min": [null, 8, null], "max": [null, null, null], "falloff": 4}, "label": "Taper the bed"},
+    {"type": "stretch", "enabled": true, "axis": "z", "at": 10, "amount": 4, "band": 0, "side": "neg", "region": {"min": [null, -40, null], "max": [null, 8, null], "falloff": 8}, "label": "Drop the doors"}
   ]
 }

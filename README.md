@@ -33,10 +33,32 @@ Mesh editors have plenty of ways to sculpt by eye. Very few let you say exactly 
 | Move | Push a region along an axis | Raise a fender lip |
 | Mirror | Cut at a plane, reflect the kept half | Symmetrise a lopsided source |
 
-Any shaping step can be **limited to a region** (an axis-aligned box) with a blend distance so the edit fades out instead of creasing. The ⌖ buttons let you pick a coordinate by clicking the model.
+Any shaping step can be **limited to a region** (an axis-aligned box) with a blend distance so the edit fades out instead of creasing.
 
-5. Check the readout: size change per axis, face count, and whether the mesh is watertight. **Strain** colours faces by how much they stretched (grey 0, red 30%+). **Before** overlays the original outline.
-6. **Export STL**. Use **Save recipe** to keep the steps.
+Steps run top to bottom. Clicking one opens it and shows the model only up to that step. Give steps names ("Widen nose") so a recipe reads like instructions. The line under each step says what it did: how the outer size changed, how many points a pin holds, or a warning when a step moved nothing.
+
+5. Set positions any of these ways:
+   - **Drag the grips** in the 3D view. They sit on split planes, mirror planes, taper ends and region bounds. Hold Shift for 0.1 mm steps.
+   - **Type a number**, press ↑/↓ (Shift ×10, Alt fine), or drag the field's label sideways.
+   - **Click ⌖**, then click the model to take that point's coordinate.
+6. Check your work:
+   - The readout shows the size change per axis, the face count, and whether the mesh is watertight.
+   - **Strain** colours faces by how much they stretched (grey 0, red 30%+).
+   - **Moved** colours faces by how far they moved, in the selected step or across all steps.
+   - **Before** outlines the model as it was before the selected step.
+   - To measure, click a point, then Shift-click a second.
+7. **Export STL**. Use **Save recipe** to keep the steps as a file.
+
+Your model and steps are saved in this browser (IndexedDB), so a reload picks up where you left off. Nothing is uploaded.
+
+| Keys | |
+|---|---|
+| Ctrl/⌘ + Z, Shift + Z | Undo, redo |
+| Ctrl/⌘ + D | Duplicate the selected step |
+| Del | Delete the selected step |
+| Esc | Close the selected step / cancel a pick |
+| F | Fit the model in view |
+| Double-click the model | Orbit around that point |
 
 ## Running it
 
@@ -87,7 +109,6 @@ Sculpt brushes, general booleans, NURBS/CAD conversion, slicing, accounts or clo
 - Bend about a line
 - Thickness snap-back (keep exact wall thickness under any deform)
 - 3MF export
-- Drag handles for planes and regions
 - Self-intersection check after aggressive edits
 - Refine only near the edits, for lighter output files
 

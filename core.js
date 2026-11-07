@@ -439,7 +439,7 @@ export function evaluate(base, ops, upTo = ops.length, cache = null) {
   const n = Math.min(upTo, ops.length);
   for (let i = 0; i < n; i++) {
     const op = ops[i];
-    sig += '|' + JSON.stringify(op);
+    sig += '|' + JSON.stringify(op, (k, v) => (k === 'label' ? undefined : v)); // renaming a step shouldn't recompute it
     const hit = cache && cache[i] && cache[i].sig === sig ? cache[i] : null;
     if (hit) {
       trace.push(hit.trace);
@@ -468,7 +468,7 @@ function applyOp(mesh, op, pins) {
   switch (op.type) {
     case 'rotate': return rotateOp(mesh, op, pins);
     case 'refine': return refineOp(mesh, op, pins);
-    case 'pin': return { mesh, pins: [...pins, pinBox(op)], note: '' };
+    case 'pin': return pinOp(mesh, op, pins);
     case 'mirror': return mirrorOp(mesh, op, pins);
     case 'stretch':
     case 'taper':
@@ -590,6 +590,17 @@ function pinCenter(pin) {
   return [0, 1, 2].map((k) => (pin.min[k] + pin.max[k]) / 2);
 }
 
+function pinOp(mesh, op, pins) {
+  const box = pinBox(op);
+  const P = mesh.positions;
+  let held = 0;
+  for (let i = 0; i < P.length; i += 3) {
+    if (P[i] >= box.min[0] && P[i] <= box.max[0] && P[i + 1] >= box.min[1] && P[i + 1] <= box.max[1] && P[i + 2] >= box.min[2] && P[i + 2] <= box.max[2]) held++;
+  }
+  const note = held ? `Holds ${held.toLocaleString()} points.` : "The box doesn't touch the model, so it holds nothing.";
+  return { mesh, pins: [...pins, box], note };
+}
+
 function deformOp(mesh, op, pins) {
   const field = makeField(op);
   const a = field.axis;
@@ -597,6 +608,7 @@ function deformOp(mesh, op, pins) {
   const out = new Float32Array(P);
   const pinned = pins.map((pin) => ({ pin, d: field.f(pinCenter(pin)) }));
   const p = [0, 0, 0];
+  let moved = 0;
   for (let i = 0; i < P.length; i += 3) {
     p[0] = P[i]; p[1] = P[i + 1]; p[2] = P[i + 2];
     let d = field.f(p);
@@ -609,14 +621,23 @@ function deformOp(mesh, op, pins) {
       }
       if (best > 0) d += (bd - d) * best;
     }
-    if (d) out[i + a] = P[i + a] + d;
+    if (d) {
+      out[i + a] = P[i + a] + d;
+      if (Math.abs(d) > 1e-4) moved++;
+    }
   }
   const nextPins = pinned.map(({ pin, d }) => {
     const q = clonePin(pin);
     q.min[a] += d; q.max[a] += d;
     return q;
   });
-  return { mesh: { positions: out, indices: mesh.indices, strain: addStrain(mesh, out) }, pins: nextPins, note: field.note };
+  const notes = [field.note];
+  if (!moved) notes.push('Nothing moved. Check the plane, the amount and the region.');
+  return {
+    mesh: { positions: out, indices: mesh.indices, strain: addStrain(mesh, out) },
+    pins: nextPins,
+    note: notes.filter(Boolean).join(' '),
+  };
 }
 
 // Per-face strain: the largest relative change in any edge length, accumulated across ops.
