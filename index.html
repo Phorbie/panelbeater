@@ -266,6 +266,18 @@ body.scrubbing, body.scrubbing * { cursor: ew-resize !important; user-select: no
 .intro-actions .btn { height: 30px; }
 
 .op-help { margin: 0 0 2px; font-size: 13px; color: var(--muted); max-width: 52ch; }
+.model { display: grid; gap: 8px; }
+.turns { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.btn.small { height: 30px; padding: 0 9px; font: 600 13px var(--f-num); gap: 4px; }
+.btn.small svg { width: 14px; height: 14px; }
+.chks { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; }
+.chk { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; cursor: pointer; }
+.chk input { accent-color: var(--tape); width: 15px; height: 15px; }
+.tapechip { display: inline-block; width: 12px; height: 12px; border-radius: 2px; background: var(--tape-soft); border: 1.5px solid var(--tape); }
+.rrow.solo { grid-template-columns: 18px minmax(0, 1fr) auto auto minmax(0, 1fr) auto; }
+/* A hint placed straight inside a section spans it; pinned to column 2 it would add a column. */
+.rbody > .fhint { grid-column: 1 / -1; margin-top: 0; }
+.op.zone .op-n { display: grid; place-items: center end; }
 .op-type { color: var(--muted); }
 .op-note { display: flex; flex-wrap: wrap; gap: 2px 10px; }
 .op-note .num { color: var(--ink); }

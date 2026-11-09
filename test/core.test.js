@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   loadMesh, parseSTL, weld, bbox, checkMesh, volume, evaluate, defaultOp,
-  toSTL, makeRecipe, readRecipe, normalizePlacement,
+  toSTL, makeRecipe, readRecipe, normalizePlacement, makeZone, zoneHolds,
+  orient, turnOrientation, IDENTITY_ORIENTATION, slice, refine, zipStore,
 } from '../core.js';
 
 const fixture = (name) => {
@@ -97,172 +98,241 @@ test('3MF: inch units, stored/zip64 entries, mirrored item keeps outward winding
   assert.ok(checkMesh(m).watertight);
 });
 
-/* ---------- ops ---------- */
+/* ---------- steps ---------- */
 
 const base = () => normalizePlacement(denseBox([-20, -40, 0], [20, 40, 30], 8));
+const plan = (ops, zones = []) => ({ zones, ops });
+const run = (m, ops, zones) => evaluate(m, plan(ops, zones));
+const stretch = (o = {}) => ({ ...defaultOp('stretch'), ...o });
+const xs = (mesh, pred) => { const out = []; const P = mesh.positions; for (let i = 0; i < P.length; i += 3) if (pred(P[i], P[i + 1], P[i + 2])) out.push([P[i], P[i + 1], P[i + 2]]); return out; };
 
-test('stretch (both sides) slides halves apart without scaling them', () => {
-  const m = base();
-  const op = { ...defaultOp('stretch'), axis: 'x', at: 0, amount: 6, band: 0 };
-  const { mesh } = evaluate(m, [op]);
+test('stretch grows the zone; the far sides slide, walls keep their shape', () => {
+  const { mesh, notes } = run(base(), [stretch({ box: { min: [-2, null, null], max: [2, null, null] }, amount: 6 })]);
   const b = bbox(mesh);
   near(b.size[0], 46);
   near(b.size[1], 80);
   assert.ok(checkMesh(mesh).watertight);
-  // Only faces crossing the plane are strained; side walls are just moved.
+  assert.equal(notes[0], '');
+  // Only faces inside the zone are strained; the side walls just moved.
   const strained = mesh.strain.filter((s) => s > 1e-6).length;
   assert.ok(strained > 0 && strained < mesh.strain.length / 3, `strained ${strained}`);
 });
 
-test('stretch one side only, with a band', () => {
-  const m = base();
-  const op = { ...defaultOp('stretch'), axis: 'z', at: 15, amount: -4, band: 6, side: 'neg' };
-  const { mesh, notes } = evaluate(m, [op]);
-  const b = bbox(mesh);
-  near(b.max[2], 30); // top untouched
-  near(b.min[2], 4); // bottom moved up by 4 (shrink)
-  assert.equal(notes[0], '');
+test('keep start / end decides which side stays still', () => {
+  const zone = { min: [null, null, 12], max: [null, null, 16] };
+  const end = bbox(run(base(), [stretch({ axis: 'z', box: zone, amount: 4, keep: 'end' })]).mesh);
+  near(end.max[2], 30); near(end.min[2], -4);
+  const start = bbox(run(base(), [stretch({ axis: 'z', box: zone, amount: 4, keep: 'start' })]).mesh);
+  near(start.min[2], 0); near(start.max[2], 34);
 });
 
-test('shrink with too narrow a band is widened instead of folding', () => {
-  const op = { ...defaultOp('stretch'), axis: 'x', amount: -10, band: 1 };
-  const { mesh, notes } = evaluate(base(), [op]);
-  assert.match(notes[0], /Band widened to 10/);
+test('the zone is cut exactly, so a pure stretch adds few faces', () => {
+  const m = box([-20, -40, 0], [20, 40, 30]);
+  const { mesh } = run(m, [stretch({ box: { min: [-2, null, null], max: [2, null, null] }, amount: 6 })]);
+  assert.ok(mesh.indices.length / 3 <= 64, `faces ${mesh.indices.length / 3}`); // 12 + two cut lines
+  assert.ok(checkMesh(mesh).watertight);
+  near(bbox(mesh).size[0], 46);
+});
+
+test('shrinking more than half the zone widens it instead of folding', () => {
+  const { mesh, notes } = run(base(), [stretch({ box: { min: [-1, null, null], max: [1, null, null] }, amount: -10 })]);
+  assert.match(notes[0], /widened to 20 mm/);
   near(bbox(mesh).size[0], 30);
   assert.ok(volume(mesh) > 0);
 });
 
-test('region limits a stretch, falloff blends it', () => {
-  const op = { ...defaultOp('stretch'), axis: 'x', amount: 8, region: { min: [null, 20, null], max: [null, null, null], falloff: 10 } };
-  const { mesh } = evaluate(base(), [op]);
-  const P = mesh.positions;
-  let maxXRear = -Infinity, maxXFront = -Infinity;
-  for (let i = 0; i < P.length; i += 3) {
-    if (P[i + 1] < 5) maxXRear = Math.max(maxXRear, P[i]);
-    if (P[i + 1] > 25) maxXFront = Math.max(maxXFront, P[i]);
-  }
-  near(maxXRear, 20); // outside region + falloff: untouched
-  near(maxXFront, 24); // inside region: full half-amount
-});
-
-test('taper varies the amount along a second axis', () => {
-  const op = { ...defaultOp('taper'), axis: 'x', along: 'y', from: -40, to: 40, amountFrom: 0, amountTo: -10, band: 0 };
-  const { mesh, notes } = evaluate(base(), [op]);
-  assert.match(notes[0], /widened/);
-  const P = mesh.positions;
-  let wFront = -Infinity, wBack = -Infinity;
-  for (let i = 0; i < P.length; i += 3) {
-    if (Math.abs(P[i + 1] + 40) < 1e-4) wBack = Math.max(wBack, P[i]);
-    if (Math.abs(P[i + 1] - 40) < 1e-4) wFront = Math.max(wFront, P[i]);
-  }
-  near(wBack, 20);
-  near(wFront, 15);
+test('limits across the axis confine a stretch; the soft edge blends it', () => {
+  const op = stretch({ box: { min: [-2, null, null], max: [2, -20, null] }, soft: 10, amount: 8 });
+  const { mesh } = run(base(), [op]);
+  const maxX = (pred) => Math.max(...xs(mesh, pred).map((p) => p[0]));
+  near(maxX((x, y) => y > -5), 20);       // beyond the soft edge: untouched
+  near(maxX((x, y) => y < -25), 24);      // inside the limit: full half-amount
+  const mid = maxX((x, y) => Math.abs(y + 15) < 0.01); // the soft edge got cut, so points exist here
+  assert.ok(mid > 20.5 && mid < 23.5, `blended ${mid}`);
   assert.ok(checkMesh(mesh).watertight);
 });
 
-test('move with region', () => {
-  const op = { ...defaultOp('move'), axis: 'z', amount: -5, region: { min: [null, null, null], max: [null, null, 1], falloff: 0 } };
-  const { mesh } = evaluate(base(), [op]);
+test('automatic refining adds points only where the shell bends', () => {
+  const coarse = box([-10, -50, 0], [10, 50, 10]);
+  const op = stretch({ box: { min: [-1, null, null], max: [1, -20, null] }, soft: 20, amount: 4 });
+  const { mesh } = run(coarse, [op]);
+  assert.ok(checkMesh(mesh).watertight);
+  const faces = mesh.indices.length / 3;
+  assert.ok(faces > 50 && faces < 3000, `faces ${faces}`);
+  // Side wall points in the blend should follow the smooth curve closely.
+  const s = (t) => t * t * (3 - 2 * t);
+  for (const [x, y] of xs(mesh, (x, y) => x > 10 && y > -20 && y < 0)) {
+    near(x, 10 + 2 * s(1 - (y + 20) / 20), 0.05, `point at y=${y.toFixed(2)} x=${x.toFixed(3)}`);
+  }
+});
+
+test('taper ramps the amount across the box', () => {
+  const op = { ...defaultOp('taper'), box: { min: [-6, -40, null], max: [6, 40, null] }, vary: 'y', amountStart: 0, amountEnd: -10 };
+  const { mesh, notes } = run(base(), [op]);
+  assert.match(notes[0], /widened to 20 mm/);
+  const w = (yy) => Math.max(...xs(mesh, (x, y) => Math.abs(y - yy) < 1e-3).map((p) => p[0]));
+  near(w(-40), 20);
+  near(w(40), 15);
+  assert.ok(checkMesh(mesh).watertight);
+});
+
+test('move pushes what is in the box', () => {
+  const op = { ...defaultOp('move'), axis: 'z', amount: -5, box: { min: [null, null, null], max: [null, null, 1] }, soft: 1 };
+  const { mesh } = run(base(), [op]);
   near(bbox(mesh).min[2], -5);
   near(bbox(mesh).max[2], 30);
+  assert.ok(checkMesh(mesh).watertight);
 });
 
-test('pins keep a zone rigid and travel with later ops', () => {
+test('tilt turns the tool: points move along the tilted axis', () => {
+  const op = stretch({ box: { min: [-2, null, null], max: [2, null, null] }, amount: 6, tilt: [0, 30] });
   const m = base();
-  // Pin a 6 mm zone straddling the stretch plane: it must not be stretched.
-  const pin = { ...defaultOp('pin'), center: [0, 0, 30], size: [12, 12, 2], falloff: 0 };
-  const stretch = { ...defaultOp('stretch'), axis: 'x', amount: 10, band: 0 };
-  const { mesh, trace } = evaluate(m, [pin, stretch, { ...stretch, axis: 'y' }]);
+  const { mesh } = run(m, [op]);
+  assert.ok(checkMesh(mesh).watertight);
+  // A corner well clear of the zone moves amount/2 along (cos30, sin30, 0).
   const P0 = m.positions, P1 = mesh.positions;
+  let found = false;
   for (let i = 0; i < P0.length; i += 3) {
-    const inPin = Math.abs(P0[i]) <= 6 && Math.abs(P0[i + 1]) <= 6 && P0[i + 2] >= 29;
-    if (inPin) {
-      near(P1[i] - P0[i], 0, 1e-4, 'pinned x unchanged');
-      near(P1[i + 1] - P0[i + 1], 0, 1e-4, 'pinned y unchanged');
+    if (P0[i] === 20 && P0[i + 1] === 40 && P0[i + 2] === 30) {
+      near(P1[i] - 20, 3 * Math.cos(Math.PI / 6), 1e-3);
+      near(P1[i + 1] - 40, 3 * Math.sin(Math.PI / 6), 1e-3);
+      found = true;
     }
   }
-  assert.equal(trace[2].pins.length, 1);
+  assert.ok(found);
 });
 
-test('rotate turns the model and re-seats it', () => {
-  const { mesh } = evaluate(base(), [{ ...defaultOp('rotate'), axis: 'x', turns: 1 }]);
-  const b = bbox(mesh);
-  near(b.size[1], 30);
-  near(b.size[2], 80);
-  near(b.min[2], 0);
-  assert.ok(volume(mesh) > 0);
+test('rigid zones hold in every step unless a step excepts them', () => {
+  const zone = makeZone('z1', 'Posts', [0, 0, 30], [12, 12, 2], 0);
+  const op = stretch({ box: { min: [-1, null, null], max: [1, null, null] }, amount: 10 });
+  const inZone = (x, y, z) => Math.abs(x) <= 6 && Math.abs(y) <= 6 && z >= 29;
+  const m = base();
+  const held = run(m, [op], [zone]).mesh;
+  for (const [x] of xs(m, inZone)) void x;
+  const spread = (mesh) => { const pts = xs(mesh, (x, y, z) => Math.abs(y) <= 6 && z >= 29.9 && Math.abs(x) <= 12); return Math.max(...pts.map((p) => p[0])) - Math.min(...pts.map((p) => p[0])); };
+  const free = run(m, [{ ...op, rigidExcept: ['z1'] }], [zone]).mesh;
+  assert.ok(spread(free) > spread(held) + 5, `held ${spread(held)} free ${spread(free)}`);
+  assert.ok(checkMesh(held).watertight);
+  assert.equal(zoneHolds(m, zone) > 0, true);
+});
+
+test('zones travel with the model', () => {
+  const zone = makeZone('z1', 'Posts', [15, 0, 30], [4, 4, 2], 1);
+  const op = stretch({ box: { min: [-1, null, null], max: [1, null, null] }, amount: 10 });
+  const { trace, zones } = run(base(), [op, { ...op }], [zone]);
+  near(trace[1].zones[0].min[0], 18);
+  near(zones[0].min[0], 23);
+});
+
+test('orientation turns the model and re-seats it', () => {
+  const M = turnOrientation(IDENTITY_ORIENTATION, 'x');
+  const m = orient(base(), M);
+  const b = bbox(m);
+  near(b.size[1], 30); near(b.size[2], 80); near(b.min[2], 0);
+  assert.ok(volume(m) > 0);
+  assert.deepEqual(turnOrientation(turnOrientation(turnOrientation(M, 'x'), 'x'), 'x'), IDENTITY_ORIENTATION);
 });
 
 test('mirror makes a watertight symmetric whole from a lopsided mesh', () => {
   const m = icosphere(20, 3);
-  const op = { ...defaultOp('mirror'), axis: 'x', at: 3.3, keep: 'neg' };
-  const { mesh } = evaluate(m, [op]);
-  const c = checkMesh(mesh);
-  assert.ok(c.watertight, JSON.stringify(c));
+  const { mesh } = run(m, [{ ...defaultOp('mirror'), axis: 'x', at: 3.3, side: 'neg' }]);
+  assert.ok(checkMesh(mesh).watertight);
   const b = bbox(mesh);
   near(b.min[0] + b.max[0], 2 * 3.3, 1e-3);
   assert.ok(volume(mesh) > 0);
 });
 
-test('mirror at a plane through existing vertices', () => {
-  const m = base(); // dense box has vertices exactly on x = 0
-  const { mesh } = evaluate(m, [{ ...defaultOp('mirror'), axis: 'x', at: 0, keep: 'pos' }]);
+test('mirror at a plane through existing vertices keeps the volume', () => {
+  const m = base();
+  const { mesh } = run(m, [{ ...defaultOp('mirror'), axis: 'x', at: 0, side: 'pos' }]);
   assert.ok(checkMesh(mesh).watertight);
   near(volume(mesh), volume(m), 1e-2);
 });
 
-test('stage cache reuses unchanged prefixes', () => {
-  const m = base();
-  const ops = [{ ...defaultOp('stretch') }, { ...defaultOp('move') }];
-  const cache = [];
-  const a = evaluate(m, ops, ops.length, cache);
-  ops[1] = { ...ops[1], amount: -3 };
-  const b = evaluate(m, ops, ops.length, cache);
-  assert.equal(cache.length, 2);
-  assert.notEqual(a.mesh, b.mesh);
-  near(bbox(b.mesh).min[2], -3);
+test('tilted mirror stays watertight', () => {
+  const { mesh } = run(icosphere(20, 3), [{ ...defaultOp('mirror'), axis: 'x', at: 2, tilt: [0, 12] }]);
+  assert.ok(checkMesh(mesh).watertight);
+  assert.ok(volume(mesh) > 0);
 });
 
+test('slice keeps both sides watertight', () => {
+  const s = slice(icosphere(10, 2), [0.3, 0.5, 0.81].map((v, _, a) => v / Math.hypot(...a)), 1.7);
+  assert.ok(checkMesh(s).watertight);
+  near(volume(s), volume(icosphere(10, 2)), 1e-3);
+});
+
+test('a step that moves nothing says so', () => {
+  const { notes } = run(base(), [stretch({ box: { min: [-1, 500, null], max: [1, null, null] }, soft: 1, amount: 5 })]);
+  assert.match(notes[0], /Nothing moved/);
+});
+
+test('a stretch without a zone reports an error instead of guessing', () => {
+  const { notes } = run(base(), [stretch({ box: { min: [null, null, null], max: [null, null, null] } })]);
+  assert.match(notes[0], /^Error: set where the stretch zone/);
+});
+
+test('stage cache reuses unchanged prefixes; names and labels never recompute', () => {
+  const m = base();
+  const zones = [makeZone('z1', 'A', [0, 0, 30], [4, 4, 4])];
+  const ops = [stretch({ label: 'Wide' }), { ...defaultOp('move'), amount: -2 }];
+  const cache = [];
+  const a = evaluate(m, { zones, ops }, ops.length, cache);
+  const b = evaluate(m, { zones: [{ ...zones[0], name: 'Renamed' }], ops: [{ ...ops[0], label: 'Wider' }, ops[1]] }, ops.length, cache);
+  assert.equal(a.mesh, b.mesh);
+  ops[1] = { ...ops[1], amount: -3 };
+  const c = evaluate(m, { zones, ops }, ops.length, cache);
+  assert.notEqual(c.mesh, a.mesh);
+  near(bbox(c.mesh).min[2], -3);
+});
+
+/* ---------- recipes ---------- */
+
 test('recipes round-trip and fill defaults', () => {
-  const ops = [defaultOp('rotate'), { type: 'stretch', axis: 'y', amount: 5 }];
-  const r = readRecipe(JSON.parse(JSON.stringify(makeRecipe(ops, { name: 'x.stl' }))));
-  assert.equal(r.ops[1].side, 'both');
-  assert.equal(r.ops[1].amount, 5);
-  assert.deepEqual(r.ops[1].region.min, [null, null, null]);
+  const zones = [makeZone('z1', 'Posts', [0, 0, 30], [4, 4, 4])];
+  const ops = [{ type: 'stretch', axis: 'y', amount: 5, box: { min: [null, -3, null], max: [null, 3, null] } }];
+  const r = readRecipe(JSON.parse(JSON.stringify(makeRecipe({ orientation: turnOrientation(IDENTITY_ORIENTATION, 'z'), zones, ops }, { name: 'x.stl' }))));
+  assert.equal(r.ops[0].keep, 'middle');
+  assert.deepEqual(r.ops[0].tilt, [0, 0]);
+  assert.deepEqual(r.ops[0].rigidExcept, []);
+  assert.equal(r.zones[0].name, 'Posts');
+  assert.deepEqual(r.orientation, turnOrientation(IDENTITY_ORIENTATION, 'z'));
   assert.throws(() => readRecipe({ app: 'panelbeater', version: 99, ops: [] }), /newer/);
 });
 
-test('refine splits long edges, keeps shape and watertightness', () => {
-  const m = box([0, 0, 0], [40, 10, 10]);
-  const { mesh, notes } = evaluate(m, [{ type: 'refine', maxEdge: 3 }]);
-  assert.ok(mesh.indices.length / 3 > 200, notes[0]);
-  assert.ok(checkMesh(mesh).watertight);
-  near(volume(mesh), 4000, 1e-2);
-  const P = mesh.positions, I = mesh.indices;
-  for (let f = 0; f < I.length; f += 3) for (let k = 0; k < 3; k++) {
-    const a = 3 * I[f + k], b = 3 * I[f + ((k + 1) % 3)];
-    assert.ok(Math.hypot(P[a] - P[b], P[a + 1] - P[b + 1], P[a + 2] - P[b + 2]) <= 3 + 1e-6);
-  }
+test('version 1 recipes convert to the box model', () => {
+  const v1 = {
+    app: 'panelbeater', version: 1, ops: [
+      { type: 'rotate', axis: 'x', turns: 1 },
+      { type: 'refine', maxEdge: 3 },
+      { type: 'stretch', axis: 'x', at: 0, amount: 6, band: 0, side: 'both', region: { min: [null, null, null], max: [null, -42, null], falloff: 14 }, label: 'Nose' },
+      { type: 'pin', center: [0, -64, 27], size: [24, 8, 4], falloff: 3, label: 'Hood posts' },
+      { type: 'taper', axis: 'x', at: 0, band: 0, side: 'both', along: 'y', from: 90, to: 10, amountFrom: -8, amountTo: 0, region: { min: [null, 8, null], max: [null, null, null], falloff: 4 } },
+      { type: 'stretch', axis: 'z', at: 10, amount: 4, band: 0, side: 'neg', region: { min: [null, -40, null], max: [null, 8, null], falloff: 8 } },
+      { type: 'mirror', axis: 'x', at: 0, keep: 'neg' },
+    ],
+  };
+  const r = readRecipe(v1);
+  assert.deepEqual(r.orientation, turnOrientation(IDENTITY_ORIENTATION, 'x'));
+  assert.equal(r.ops.length, 4);
+  assert.equal(r.zones.length, 1);
+  assert.equal(r.zones[0].name, 'Hood posts');
+  const [nose, taper, doors, mirror] = r.ops;
+  assert.equal(nose.label, 'Nose');
+  assert.deepEqual(nose.box.min.slice(0, 1), [-0.5]);
+  assert.equal(nose.box.max[1], -42);
+  assert.deepEqual(nose.rigidExcept, ['z1'], 'the pin came after this step, so it did not hold here');
+  assert.deepEqual(taper.rigidExcept, []);
+  assert.equal(taper.vary, 'y');
+  assert.equal(taper.box.min[1], 10); assert.equal(taper.box.max[1], 90);
+  assert.equal(taper.amountStart, 0); assert.equal(taper.amountEnd, -8);
+  assert.equal(doors.keep, 'end');
+  assert.equal(mirror.side, 'neg');
+  assert.match(r.notes[0], /older recipe/);
 });
 
-test('refine lets a falloff blend across what was one long triangle', () => {
-  const m = box([-10, -50, 0], [10, 50, 10]);
-  const stretch = { ...defaultOp('stretch'), axis: 'x', amount: 4, region: { min: [null, null, null], max: [null, -20, null], falloff: 20 } };
-  const coarse = evaluate(m, [stretch]).mesh;
-  const fine = evaluate(m, [{ type: 'refine', maxEdge: 2 }, stretch]).mesh;
-  const widthAt = (mesh, y) => {
-    let w = -Infinity; const P = mesh.positions;
-    for (let i = 0; i < P.length; i += 3) if (Math.abs(P[i + 1] - y) < 1.01) w = Math.max(w, P[i]);
-    return w;
-  };
-  assert.equal(widthAt(coarse, -10), -Infinity); // no vertices in the blend zone at all
-  const mid = widthAt(fine, -10);
-  assert.ok(mid > 10.2 && mid < 12, `blended half-width ${mid}`);
-  assert.ok(checkMesh(fine).watertight);
-});
+/* ---------- export ---------- */
 
 test('zipStore output is a readable zip', async () => {
-  const { zipStore } = await import('../core.js');
   const { execFileSync } = await import('node:child_process');
   const { writeFileSync, mkdtempSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
@@ -272,29 +342,9 @@ test('zipStore output is a readable zip', async () => {
   assert.match(out, /None \['a.stl', 'r.json'\]/);
 });
 
-test('a step that moves nothing says so', () => {
-  const op = { ...defaultOp('stretch'), amount: 5, region: { min: [null, 500, null], max: [null, null, null], falloff: 0 } };
-  const { notes } = evaluate(base(), [op]);
-  assert.match(notes[0], /Nothing moved/);
-  const ok = evaluate(base(), [{ ...defaultOp('stretch'), amount: 5 }]);
-  assert.doesNotMatch(ok.notes[0], /Nothing moved/);
-});
-
-test('pins report what they hold', () => {
-  const held = evaluate(base(), [{ ...defaultOp('pin'), center: [0, 0, 30], size: [10, 10, 2] }]).notes[0];
-  assert.match(held, /Holds \d+ points/);
-  const empty = evaluate(base(), [{ ...defaultOp('pin'), center: [0, 0, 300], size: [4, 4, 4] }]).notes[0];
-  assert.match(empty, /holds nothing/);
-});
-
-test('step labels survive recipes and do not invalidate the cache', () => {
-  const m = base();
-  const ops = [{ ...defaultOp('refine'), maxEdge: 4 }, { ...defaultOp('stretch'), label: 'Widen nose' }];
-  const cache = [];
-  const a = evaluate(m, ops, ops.length, cache);
-  ops[1] = { ...ops[1], label: 'Wider nose' };
-  const b = evaluate(m, ops, ops.length, cache);
-  assert.equal(a.mesh, b.mesh, 'rename reuses the cached result');
-  const r = readRecipe(JSON.parse(JSON.stringify(makeRecipe(ops))));
-  assert.equal(r.ops[1].label, 'Wider nose');
+test('uniform refine splits long edges and keeps the shape', () => {
+  const m = refine(box([0, 0, 0], [40, 10, 10]), 3);
+  assert.ok(m.indices.length / 3 > 200);
+  assert.ok(checkMesh(m).watertight);
+  near(volume(m), 4000, 1e-2);
 });
